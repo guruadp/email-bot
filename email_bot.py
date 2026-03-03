@@ -3,11 +3,13 @@ import json
 import time
 import re
 import html
+import base64
 import requests
 import msal
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import quote
 
 load_dotenv()
 
@@ -19,11 +21,14 @@ def get_required_env(name):
 
 TENANT_ID = get_required_env("TENANT_ID")  # Directory (tenant) ID
 CLIENT_ID = get_required_env("CLIENT_ID")  # Application (client) ID
+CLIENT_SECRET = get_required_env("CLIENT_SECRET")  # Application client secret
+MAILBOX_USER = get_required_env("MAILBOX_USER")  # User principal name or user id
+DIRECT_TO_ADDRESS = MAILBOX_USER.strip().lower()
 
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPES = ["User.Read", "Mail.Read", "Mail.ReadWrite"]
+SCOPES = ["https://graph.microsoft.com/.default"]
+MAILBOX_USER_ENCODED = quote(MAILBOX_USER, safe="")
 
-TOKEN_CACHE_FILE = "token_cache.bin"
 POLL_SECONDS = 15
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -32,6 +37,46 @@ FALLBACK_REPLY_TEXT = (
     "Thanks for your email. I have received it and will get back to you shortly.\n\n"
     "Best regards,"
 )
+
+
+def raise_for_status_with_details(resp, context):
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        try:
+            details = json.dumps(resp.json(), indent=2)
+        except ValueError:
+            details = (resp.text or "").strip()
+        raise RuntimeError(
+            f"{context} failed with HTTP {resp.status_code}.\nResponse body:\n{details}"
+        ) from exc
+
+
+def decode_jwt_payload(token):
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload + padding).decode("utf-8")
+        return json.loads(decoded)
+    except Exception:
+        return {}
+
+
+def print_token_diagnostics(token):
+    payload = decode_jwt_payload(token)
+    roles = payload.get("roles") or []
+    scp = payload.get("scp")
+
+    print("Token diagnostics:")
+    print("  roles:", roles if roles else "(none)")
+    print("  scp:", scp if scp else "(none)")
+
+    if "Mail.ReadWrite" not in roles:
+        print("Warning: token is missing app role 'Mail.ReadWrite'.")
+        print("Check Graph API permissions (Application) and admin consent.")
 
 
 def build_http_session():
@@ -50,40 +95,15 @@ def build_http_session():
     session.mount("http://", adapter)
     return session
 
-def load_cache():
-    cache = msal.SerializableTokenCache()
-    if os.path.exists(TOKEN_CACHE_FILE):
-        cache.deserialize(open(TOKEN_CACHE_FILE, "r").read())
-    return cache
-
-def save_cache(cache):
-    if cache.has_state_changed:
-        open(TOKEN_CACHE_FILE, "w").write(cache.serialize())
-
 def get_token():
-    cache = load_cache()
     session = build_http_session()
-    app = msal.PublicClientApplication(
+    app = msal.ConfidentialClientApplication(
         CLIENT_ID,
         authority=AUTHORITY,
-        token_cache=cache,
+        client_credential=CLIENT_SECRET,
         http_client=session,
     )
-    accounts = app.get_accounts()
-    result = None
-
-    if accounts:
-        result = app.acquire_token_silent(SCOPES, account=accounts[0])
-
-    if not result:
-        flow = app.initiate_device_flow(scopes=SCOPES)
-        if "user_code" not in flow:
-            raise RuntimeError(f"Device flow init failed: {json.dumps(flow, indent=2)}")
-
-        print(flow["message"])
-        result = app.acquire_token_by_device_flow(flow)
-
-    save_cache(cache)
+    result = app.acquire_token_for_client(scopes=SCOPES)
 
     if "access_token" not in result:
         raise RuntimeError(f"Token failed: {json.dumps(result, indent=2)}")
@@ -100,9 +120,9 @@ def strip_html(text):
 
 
 def get_full_message_body(session, headers, message_id):
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}?$select=body,bodyPreview"
+    url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages/{message_id}?$select=body,bodyPreview"
     resp = session.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
+    raise_for_status_with_details(resp, "Fetch message body")
     data = resp.json()
     body = (data.get("body") or {}).get("content", "")
     body_type = ((data.get("body") or {}).get("contentType") or "").lower()
@@ -170,15 +190,15 @@ def create_reply_draft(session, headers, original_message, reply_text):
     if not message_id:
         return None
 
-    create_url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/createReply"
+    create_url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages/{message_id}/createReply"
     create_resp = session.post(create_url, headers=headers, timeout=30)
-    create_resp.raise_for_status()
+    raise_for_status_with_details(create_resp, "Create reply draft")
     draft = create_resp.json()
     draft_id = draft.get("id")
     if not draft_id:
         return None
 
-    patch_url = f"https://graph.microsoft.com/v1.0/me/messages/{draft_id}"
+    patch_url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages/{draft_id}"
     patch_body = {
         "body": {
             "contentType": "Text",
@@ -187,19 +207,31 @@ def create_reply_draft(session, headers, original_message, reply_text):
     }
     patch_headers = {**headers, "Content-Type": "application/json"}
     patch_resp = session.patch(patch_url, headers=patch_headers, json=patch_body, timeout=30)
-    patch_resp.raise_for_status()
+    raise_for_status_with_details(patch_resp, "Update reply draft body")
     return draft_id
+
+
+def get_to_addresses(message):
+    recipients = message.get("toRecipients") or []
+    addresses = []
+    for recipient in recipients:
+        address = (recipient.get("emailAddress") or {}).get("address")
+        if address:
+            addresses.append(address.strip().lower())
+    return addresses
 
 def main():
     token = get_token()
+    print_token_diagnostics(token)
     headers = {"Authorization": f"Bearer {token}"}
     session = build_http_session()
     print("LLM mode:", "enabled" if OPENAI_API_KEY else "disabled")
+    print("Mailbox mode: app-only auth for", MAILBOX_USER)
 
     url = (
-        "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
+        f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/mailFolders/Inbox/messages"
         "?$top=50&$orderby=receivedDateTime desc"
-        "&$select=id,subject,from,receivedDateTime,bodyPreview"
+        "&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview"
     )
 
     seen_ids = set()
@@ -207,7 +239,7 @@ def main():
     try:
         # Prime the seen set so existing inbox items are not printed as "new".
         first = session.get(url, headers=headers, timeout=30)
-        first.raise_for_status()
+        raise_for_status_with_details(first, "Initial inbox poll")
         for m in first.json().get("value", []):
             mid = m.get("id")
             if mid:
@@ -217,7 +249,7 @@ def main():
 
         while True:
             r = session.get(url, headers=headers, timeout=30)
-            r.raise_for_status()
+            raise_for_status_with_details(r, "Inbox poll")
             items = r.json().get("value", [])
 
             # Show oldest-to-newest among unseen items for readable output order.
@@ -231,6 +263,13 @@ def main():
                 print("Subject:", m.get("subject"))
                 print("Received:", m.get("receivedDateTime"))
                 print("Preview:", (m.get("bodyPreview") or "")[:140])
+                to_addresses = get_to_addresses(m)
+                if DIRECT_TO_ADDRESS not in to_addresses:
+                    print(
+                        f"Draft reply skipped: not directly addressed to {DIRECT_TO_ADDRESS}. "
+                        f"To={to_addresses or ['(none)']}"
+                    )
+                    continue
                 try:
                     full_body = get_full_message_body(session, headers, mid)
                     reply_text = generate_reply_with_llm(
