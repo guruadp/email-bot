@@ -5,8 +5,11 @@ import re
 import html
 import requests
 import msal
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+load_dotenv()
 
 def get_required_env(name):
     value = os.getenv(name)
