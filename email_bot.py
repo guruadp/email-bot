@@ -30,8 +30,11 @@ SCOPES = ["https://graph.microsoft.com/.default"]
 MAILBOX_USER_ENCODED = quote(MAILBOX_USER, safe="")
 
 POLL_SECONDS = 15
+MAX_THREAD_MESSAGES = int(os.getenv("MAX_THREAD_MESSAGES", "5"))
+MAX_THREAD_CHARS_PER_MESSAGE = int(os.getenv("MAX_THREAD_CHARS_PER_MESSAGE", "1200"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
     "Thanks for your email. I have received it and will get back to you shortly.\n\n"
@@ -130,6 +133,48 @@ def sanitize_reply_text(text):
     return "\n".join(lines).strip()
 
 
+def extract_text_from_graph_message(message):
+    body = (message.get("body") or {}).get("content", "")
+    body_type = ((message.get("body") or {}).get("contentType") or "").lower()
+    if body_type == "html":
+        body = strip_html(body)
+    if not body:
+        body = message.get("bodyPreview") or ""
+    return re.sub(r"\s+", " ", body).strip()
+
+
+def build_thread_context(session, headers, conversation_id, current_message_id=None):
+    if not conversation_id:
+        return ""
+
+    escaped_conversation_id = conversation_id.replace("'", "''")
+    url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages"
+    params = {
+        "$filter": f"conversationId eq '{escaped_conversation_id}'",
+        "$orderby": "receivedDateTime desc",
+        "$top": str(MAX_THREAD_MESSAGES),
+        "$select": "id,subject,from,receivedDateTime,body,bodyPreview",
+    }
+    resp = session.get(url, headers=headers, params=params, timeout=30)
+    raise_for_status_with_details(resp, "Fetch thread messages")
+    items = resp.json().get("value", [])
+
+    items = list(reversed(items))
+    chunks = []
+    for item in items:
+        if item.get("id") == current_message_id:
+            continue
+        sender = (item.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
+        received = item.get("receivedDateTime") or "unknown-time"
+        subject = item.get("subject") or ""
+        text = extract_text_from_graph_message(item)[:MAX_THREAD_CHARS_PER_MESSAGE]
+        if text:
+            chunks.append(
+                f"From: {sender}\nReceived: {received}\nSubject: {subject}\nBody: {text}"
+            )
+    return "\n\n---\n\n".join(chunks)
+
+
 def get_full_message_body(session, headers, message_id):
     url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages/{message_id}?$select=body,bodyPreview"
     resp = session.get(url, headers=headers, timeout=30)
@@ -144,7 +189,7 @@ def get_full_message_body(session, headers, message_id):
     return body[:4000]
 
 
-def generate_reply_with_llm(sender, subject, body_text):
+def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
     if not OPENAI_API_KEY:
         print("LLM fallback: OPENAI_API_KEY is not set.")
         return FALLBACK_REPLY_TEXT
@@ -153,6 +198,7 @@ def generate_reply_with_llm(sender, subject, body_text):
         "Write a professional email reply draft.\n"
         "Requirements:\n"
         "- Keep it concise (80-160 words)\n"
+        "- Use the conversation context for continuity when provided\n"
         "- Acknowledge the sender's request\n"
         "- Ask one clarifying question if needed\n"
         "- Do not include any email headers (no Subject/From/To/Cc lines)\n"
@@ -163,6 +209,7 @@ def generate_reply_with_llm(sender, subject, body_text):
         "- Return plain text only\n\n"
         f"Sender: {sender}\n"
         f"Subject: {subject}\n"
+        f"Conversation context (older messages, if any):\n{thread_context or '(none)'}\n\n"
         f"Email body:\n{body_text}\n"
     )
     headers = {
@@ -235,6 +282,26 @@ def get_to_addresses(message):
             addresses.append(address.strip().lower())
     return addresses
 
+
+def send_teams_notification(session, sender, subject, received, preview):
+    if not TEAMS_WEBHOOK_URL:
+        return
+    payload = {
+        "text": (
+            "New direct email received\n"
+            f"To: {MAILBOX_USER}\n"
+            f"From: {sender}\n"
+            f"Subject: {subject or '(no subject)'}\n"
+            f"Received: {received or '(unknown)'}\n"
+            f"Preview: {(preview or '')[:300]}"
+        )
+    }
+    try:
+        resp = session.post(TEAMS_WEBHOOK_URL, json=payload, timeout=15)
+        raise_for_status_with_details(resp, "Teams notification")
+    except Exception as e:
+        print("Teams notification failed:", e)
+
 def main():
     token = get_token()
     print_token_diagnostics(token)
@@ -242,11 +309,12 @@ def main():
     session = build_http_session()
     print("LLM mode:", "enabled" if OPENAI_API_KEY else "disabled")
     print("Mailbox mode: app-only auth for", MAILBOX_USER)
+    print("Teams notifications:", "enabled" if TEAMS_WEBHOOK_URL else "disabled")
 
     url = (
         f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/mailFolders/Inbox/messages"
         "?$top=50&$orderby=receivedDateTime desc"
-        "&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview"
+        "&$select=id,subject,from,toRecipients,conversationId,receivedDateTime,bodyPreview"
     )
 
     seen_ids = set()
@@ -285,19 +353,33 @@ def main():
                         f"To={to_addresses or ['(none)']}"
                     )
                     continue
+                send_teams_notification(
+                    session=session,
+                    sender=sender,
+                    subject=m.get("subject") or "",
+                    received=m.get("receivedDateTime") or "",
+                    preview=m.get("bodyPreview") or "",
+                )
                 try:
+                    thread_context = build_thread_context(
+                        session=session,
+                        headers=headers,
+                        conversation_id=m.get("conversationId"),
+                        current_message_id=mid,
+                    )
                     full_body = get_full_message_body(session, headers, mid)
                     reply_text = generate_reply_with_llm(
                         sender=sender,
                         subject=m.get("subject") or "",
                         body_text=full_body,
+                        thread_context=thread_context,
                     )
                     draft_id = create_reply_draft(session, headers, m, reply_text)
                     if draft_id:
                         print("Draft reply created:", draft_id)
                     else:
                         print("Draft reply skipped: missing draft id.")
-                except requests.RequestException as e:
+                except (requests.RequestException, RuntimeError) as e:
                     print("Draft reply failed:", e)
 
             time.sleep(POLL_SECONDS)
