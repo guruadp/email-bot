@@ -35,7 +35,9 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
     "Thanks for your email. I have received it and will get back to you shortly.\n\n"
-    "Best regards,"
+    "Best regards,\n"
+    "Guru\n"
+    "Robotics system Integration Engineer"
 )
 
 
@@ -119,6 +121,15 @@ def strip_html(text):
     return re.sub(r"\s+", " ", plain).strip()
 
 
+def sanitize_reply_text(text):
+    if not text:
+        return ""
+    lines = text.splitlines()
+    while lines and re.match(r"^\s*(subject|from|to|cc)\s*:", lines[0], flags=re.IGNORECASE):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
 def get_full_message_body(session, headers, message_id):
     url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages/{message_id}?$select=body,bodyPreview"
     resp = session.get(url, headers=headers, timeout=30)
@@ -144,7 +155,11 @@ def generate_reply_with_llm(sender, subject, body_text):
         "- Keep it concise (80-160 words)\n"
         "- Acknowledge the sender's request\n"
         "- Ask one clarifying question if needed\n"
-        "- End with a polite sign-off\n"
+        "- Do not include any email headers (no Subject/From/To/Cc lines)\n"
+        "- End with exactly this signature block:\n"
+        "Best regards,\n"
+        "Guru\n"
+        "Robotics system Integration Engineer\n"
         "- Return plain text only\n\n"
         f"Sender: {sender}\n"
         f"Subject: {subject}\n"
@@ -182,7 +197,7 @@ def generate_reply_with_llm(sender, subject, body_text):
                 break
     if not text:
         print("LLM fallback: model returned empty text.")
-    return text or FALLBACK_REPLY_TEXT
+    return sanitize_reply_text(text) or FALLBACK_REPLY_TEXT
 
 
 def create_reply_draft(session, headers, original_message, reply_text):
