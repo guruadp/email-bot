@@ -340,6 +340,19 @@ def get_to_addresses(message):
     return addresses
 
 
+def is_automated_sender(sender):
+    sender = (sender or "").lower()
+    patterns = [
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "notification",
+        "alerts",
+        "mailer-daemon",
+    ]
+    return any(p in sender for p in patterns)
+
+
 def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary):
     if not TEAMS_CHANNEL_EMAIL:
         return
@@ -418,10 +431,13 @@ def main():
                 print("Subject:", m.get("subject"))
                 print("Received:", m.get("receivedDateTime"))
                 print("Preview:", (m.get("bodyPreview") or "")[:140])
+                if is_automated_sender(sender):
+                    print("Skipped: automated email")
+                    continue
                 to_addresses = get_to_addresses(m)
                 if DIRECT_TO_ADDRESS not in to_addresses:
                     print(
-                        f"Draft reply skipped: not directly addressed to {DIRECT_TO_ADDRESS}. "
+                        f"Skipped: not directly addressed to {DIRECT_TO_ADDRESS}. "
                         f"To={to_addresses or ['(none)']}"
                     )
                     continue
