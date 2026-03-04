@@ -34,7 +34,7 @@ MAX_THREAD_MESSAGES = int(os.getenv("MAX_THREAD_MESSAGES", "5"))
 MAX_THREAD_CHARS_PER_MESSAGE = int(os.getenv("MAX_THREAD_CHARS_PER_MESSAGE", "1200"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
+TEAMS_CHANNEL_EMAIL = get_required_env("TEAMS_CHANNEL_EMAIL").strip().lower()
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
     "Thanks for your email. I have received it and will get back to you shortly.\n\n"
@@ -247,6 +247,63 @@ def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
     return sanitize_reply_text(text) or FALLBACK_REPLY_TEXT
 
 
+def generate_email_summary_with_llm(sender, subject, body_text, thread_context=""):
+    fallback = (body_text or "").strip()[:300] or "No summary available."
+    if not OPENAI_API_KEY:
+        return fallback
+
+    prompt = (
+        "Summarize this email for a Teams channel notification.\n"
+        "Requirements:\n"
+        "- Keep it concise (30-80 words)\n"
+        "- Highlight intent, key request, and urgency if any\n"
+        "- Plain text only\n\n"
+        f"Sender: {sender}\n"
+        f"Subject: {subject}\n"
+        f"Conversation context (older messages, if any):\n{thread_context or '(none)'}\n\n"
+        f"Email body:\n{body_text}\n"
+    )
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": "You write concise, accurate summaries for business emails.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    }
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = (data.get("output_text") or "").strip()
+        if not text:
+            for item in data.get("output", []):
+                for content in item.get("content", []):
+                    if content.get("type") in ("output_text", "text"):
+                        text = (content.get("text") or "").strip()
+                        if text:
+                            break
+                if text:
+                    break
+        return text or fallback
+    except Exception:
+        return fallback
+
+
 def create_reply_draft(session, headers, original_message, reply_text):
     message_id = original_message.get("id")
     if not message_id:
@@ -283,24 +340,37 @@ def get_to_addresses(message):
     return addresses
 
 
-def send_teams_notification(session, sender, subject, received, preview):
-    if not TEAMS_WEBHOOK_URL:
+def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary):
+    if not TEAMS_CHANNEL_EMAIL:
         return
+
+    url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/sendMail"
     payload = {
-        "text": (
-            "New direct email received\n"
-            f"To: {MAILBOX_USER}\n"
-            f"From: {sender}\n"
-            f"Subject: {subject or '(no subject)'}\n"
-            f"Received: {received or '(unknown)'}\n"
-            f"Preview: {(preview or '')[:300]}"
-        )
+        "message": {
+            "subject": f"New direct email: {subject or '(no subject)'}",
+            "body": {
+                "contentType": "Text",
+                "content": (
+                    "New direct email received\n"
+                    "\n"
+                    f"From: {sender}\n"
+                    f"Subject: {subject or '(no subject)'}\n"
+                    f"Received: {received or '(unknown)'}\n"
+                    "AI Summary:\n"
+                    f"{(ai_summary or 'No summary available.').strip()}"
+                ),
+            },
+            "toRecipients": [{"emailAddress": {"address": TEAMS_CHANNEL_EMAIL}}],
+        },
+        "saveToSentItems": False,
     }
+    post_headers = {**headers, "Content-Type": "application/json"}
     try:
-        resp = session.post(TEAMS_WEBHOOK_URL, json=payload, timeout=15)
-        raise_for_status_with_details(resp, "Teams notification")
+        resp = session.post(url, headers=post_headers, json=payload, timeout=15)
+        raise_for_status_with_details(resp, "Teams channel notification")
     except Exception as e:
-        print("Teams notification failed:", e)
+        print("Teams channel notification failed:", e)
+
 
 def main():
     token = get_token()
@@ -309,7 +379,9 @@ def main():
     session = build_http_session()
     print("LLM mode:", "enabled" if OPENAI_API_KEY else "disabled")
     print("Mailbox mode: app-only auth for", MAILBOX_USER)
-    print("Teams notifications:", "enabled" if TEAMS_WEBHOOK_URL else "disabled")
+    print("Teams channel notifications:", "enabled" if TEAMS_CHANNEL_EMAIL else "disabled")
+    if TEAMS_CHANNEL_EMAIL:
+        print("Teams channel email:", TEAMS_CHANNEL_EMAIL)
 
     url = (
         f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/mailFolders/Inbox/messages"
@@ -353,13 +425,6 @@ def main():
                         f"To={to_addresses or ['(none)']}"
                     )
                     continue
-                send_teams_notification(
-                    session=session,
-                    sender=sender,
-                    subject=m.get("subject") or "",
-                    received=m.get("receivedDateTime") or "",
-                    preview=m.get("bodyPreview") or "",
-                )
                 try:
                     thread_context = build_thread_context(
                         session=session,
@@ -373,6 +438,20 @@ def main():
                         subject=m.get("subject") or "",
                         body_text=full_body,
                         thread_context=thread_context,
+                    )
+                    summary_text = generate_email_summary_with_llm(
+                        sender=sender,
+                        subject=m.get("subject") or "",
+                        body_text=full_body,
+                        thread_context=thread_context,
+                    )
+                    send_teams_channel_notification(
+                        session=session,
+                        headers=headers,
+                        sender=sender,
+                        subject=m.get("subject") or "",
+                        received=m.get("receivedDateTime") or "",
+                        ai_summary=summary_text,
                     )
                     draft_id = create_reply_draft(session, headers, m, reply_text)
                     if draft_id:
