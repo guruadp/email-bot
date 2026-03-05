@@ -317,11 +317,33 @@ def create_reply_draft(session, headers, original_message, reply_text):
         return None
 
     patch_url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages/{draft_id}"
+    to_emails = []
+    sender = (original_message.get("from") or {}).get("emailAddress", {}).get("address")
+    if sender:
+        to_emails.append(sender.strip().lower())
+
+    for recipient in original_message.get("toRecipients") or []:
+        address = (recipient.get("emailAddress") or {}).get("address")
+        if address:
+            to_emails.append(address.strip().lower())
+
+    # Keep order but remove duplicates.
+    to_unique = list(dict.fromkeys(to_emails))
+
+    cc_emails = []
+    for recipient in original_message.get("ccRecipients") or []:
+        address = (recipient.get("emailAddress") or {}).get("address")
+        if address:
+            cc_emails.append(address.strip().lower())
+    cc_unique = list(dict.fromkeys(cc_emails))
+
     patch_body = {
         "body": {
             "contentType": "Text",
             "content": reply_text,
-        }
+        },
+        "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_unique],
+        "ccRecipients": [{"emailAddress": {"address": addr}} for addr in cc_unique],
     }
     patch_headers = {**headers, "Content-Type": "application/json"}
     patch_resp = session.patch(patch_url, headers=patch_headers, json=patch_body, timeout=30)
@@ -398,7 +420,7 @@ def main():
     url = (
         f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/mailFolders/Inbox/messages"
         "?$top=50&$orderby=receivedDateTime desc"
-        "&$select=id,subject,from,toRecipients,conversationId,receivedDateTime,bodyPreview"
+        "&$select=id,subject,from,toRecipients,ccRecipients,conversationId,receivedDateTime,bodyPreview"
     )
 
     seen_ids = set()
