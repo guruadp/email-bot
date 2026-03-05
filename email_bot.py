@@ -19,6 +19,14 @@ def get_required_env(name):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
+
+def get_bool_env(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 TENANT_ID = get_required_env("TENANT_ID")  # Directory (tenant) ID
 CLIENT_ID = get_required_env("CLIENT_ID")  # Application (client) ID
 CLIENT_SECRET = get_required_env("CLIENT_SECRET")  # Application client secret
@@ -35,6 +43,7 @@ MAX_THREAD_CHARS_PER_MESSAGE = int(os.getenv("MAX_THREAD_CHARS_PER_MESSAGE", "12
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 TEAMS_CHANNEL_EMAIL = get_required_env("TEAMS_CHANNEL_EMAIL").strip().lower()
+DEV_MODE = get_bool_env("DEV_MODE", default=False)
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
     "Thanks for your email. I have received it and will get back to you shortly.\n\n"
@@ -156,10 +165,30 @@ def build_thread_context(session, headers, conversation_id, current_message_id=N
         "$select": "id,subject,from,receivedDateTime,body,bodyPreview",
     }
     resp = session.get(url, headers=headers, params=params, timeout=30)
-    raise_for_status_with_details(resp, "Fetch thread messages")
+    if resp.status_code == 400:
+        try:
+            error_code = ((resp.json() or {}).get("error") or {}).get("code")
+        except ValueError:
+            error_code = None
+        if error_code == "InefficientFilter":
+            # Some tenants reject filter+orderby for conversation queries.
+            fallback_params = {
+                "$filter": f"conversationId eq '{escaped_conversation_id}'",
+                "$top": str(MAX_THREAD_MESSAGES),
+                "$select": "id,subject,from,receivedDateTime,body,bodyPreview",
+            }
+            resp = session.get(url, headers=headers, params=fallback_params, timeout=30)
+
+    if resp.status_code >= 400:
+        try:
+            raise_for_status_with_details(resp, "Fetch thread messages")
+        except RuntimeError as e:
+            print(f"Thread context skipped: {e}")
+            return ""
+
     items = resp.json().get("value", [])
 
-    items = list(reversed(items))
+    items = sorted(items, key=lambda item: item.get("receivedDateTime") or "")
     chunks = []
     for item in items:
         if item.get("id") == current_message_id:
@@ -203,7 +232,7 @@ def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
         "- Do not include any email headers (no Subject/From/To/Cc lines)\n"
         "- End with exactly this signature block:\n"
         "Best regards,\n"
-        "Guru\n"
+        "Guru Nandhan\n"
         "Robotics system Integration Engineer\n"
         "- Return plain text only\n\n"
         f"Sender: {sender}\n"
@@ -374,24 +403,32 @@ def is_automated_sender(sender):
     return any(p in sender for p in patterns)
 
 
-def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary):
+def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary, outlook_link=""):
     if not TEAMS_CHANNEL_EMAIL:
-        return
+        return False
 
+    safe_sender = html.escape(sender or "unknown")
+    safe_subject = html.escape(subject or "(no subject)")
+    safe_received = html.escape(received or "(unknown)")
+    safe_summary = html.escape((ai_summary or "No summary available.").strip()).replace("\n", "<br>")
+    open_in_outlook_html = (
+        f'<p><a href="{html.escape(outlook_link, quote=True)}">Open email</a></p>'
+        if outlook_link
+        else ""
+    )
     url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/sendMail"
     payload = {
         "message": {
             "subject": f"New direct email: {subject or '(no subject)'}",
             "body": {
-                "contentType": "Text",
+                "contentType": "HTML",
                 "content": (
-                    "New direct email received\n"
-                    "\n"
-                    f"From: {sender}\n"
-                    f"Subject: {subject or '(no subject)'}\n"
-                    f"Received: {received or '(unknown)'}\n"
-                    "AI Summary:\n"
-                    f"{(ai_summary or 'No summary available.').strip()}"
+                    "<p><strong>New direct email received</strong></p>"
+                    f"<p>From: {safe_sender}<br>"
+                    f"Subject: {safe_subject}<br>"
+                    f"Received: {safe_received}</p>"
+                    f"{open_in_outlook_html}"
+                    f"<p><strong>AI Summary:</strong><br>{safe_summary}</p>"
                 ),
             },
             "toRecipients": [{"emailAddress": {"address": TEAMS_CHANNEL_EMAIL}}],
@@ -402,8 +439,13 @@ def send_teams_channel_notification(session, headers, sender, subject, received,
     try:
         resp = session.post(url, headers=post_headers, json=payload, timeout=15)
         raise_for_status_with_details(resp, "Teams channel notification")
+        return True
     except Exception as e:
-        print("Teams channel notification failed:", e)
+        if DEV_MODE:
+            print("Teams channel notification failed:", e)
+        else:
+            print("Teams message failed")
+        return False
 
 
 def main():
@@ -414,13 +456,12 @@ def main():
     print("LLM mode:", "enabled" if OPENAI_API_KEY else "disabled")
     print("Mailbox mode: app-only auth for", MAILBOX_USER)
     print("Teams channel notifications:", "enabled" if TEAMS_CHANNEL_EMAIL else "disabled")
-    if TEAMS_CHANNEL_EMAIL:
-        print("Teams channel email:", TEAMS_CHANNEL_EMAIL)
+    print("Dev mode:", "enabled" if DEV_MODE else "disabled")
 
     url = (
         f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/mailFolders/Inbox/messages"
         "?$top=50&$orderby=receivedDateTime desc"
-        "&$select=id,subject,from,toRecipients,ccRecipients,conversationId,receivedDateTime,bodyPreview"
+        "&$select=id,subject,from,toRecipients,ccRecipients,conversationId,receivedDateTime,bodyPreview,webLink"
     )
 
     seen_ids = set()
@@ -447,20 +488,25 @@ def main():
                 mid = m["id"]
                 seen_ids.add(mid)
                 sender = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
-                print("\n--- New Mail ---")
-                print("From:", sender)
-                print("Subject:", m.get("subject"))
-                print("Received:", m.get("receivedDateTime"))
-                print("Preview:", (m.get("bodyPreview") or "")[:140])
+                if DEV_MODE:
+                    print("\n--- New Mail ---")
+                    print("From:", sender)
+                    print("Subject:", m.get("subject"))
+                    print("Received:", m.get("receivedDateTime"))
+                    print("Preview:", (m.get("bodyPreview") or "")[:140])
+                else:
+                    print("Mail received")
                 if is_automated_sender(sender):
-                    print("Skipped: automated email")
+                    if DEV_MODE:
+                        print("Skipped: automated email")
                     continue
                 to_addresses = get_to_addresses(m)
                 if DIRECT_TO_ADDRESS not in to_addresses:
-                    print(
-                        f"Skipped: not directly addressed to {DIRECT_TO_ADDRESS}. "
-                        f"To={to_addresses or ['(none)']}"
-                    )
+                    if DEV_MODE:
+                        print(
+                            f"Skipped: not directly addressed to {DIRECT_TO_ADDRESS}. "
+                            f"To={to_addresses or ['(none)']}"
+                        )
                     continue
                 try:
                     thread_context = build_thread_context(
@@ -482,19 +528,28 @@ def main():
                         body_text=full_body,
                         thread_context=thread_context,
                     )
-                    send_teams_channel_notification(
+                    teams_sent = send_teams_channel_notification(
                         session=session,
                         headers=headers,
                         sender=sender,
                         subject=m.get("subject") or "",
                         received=m.get("receivedDateTime") or "",
                         ai_summary=summary_text,
+                        outlook_link=m.get("webLink") or "",
                     )
+                    if teams_sent:
+                        print("Teams message sent")
                     draft_id = create_reply_draft(session, headers, m, reply_text)
                     if draft_id:
-                        print("Draft reply created:", draft_id)
+                        if DEV_MODE:
+                            print("Draft reply created:", draft_id)
+                        else:
+                            print("Draft created")
                     else:
-                        print("Draft reply skipped: missing draft id.")
+                        if DEV_MODE:
+                            print("Draft reply skipped: missing draft id.")
+                        else:
+                            print("Draft skipped")
                 except (requests.RequestException, RuntimeError) as e:
                     print("Draft reply failed:", e)
 
