@@ -200,7 +200,6 @@ def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
         "- Keep it concise (80-160 words)\n"
         "- Use the conversation context for continuity when provided\n"
         "- Acknowledge the sender's request\n"
-        "- Ask one clarifying question if needed\n"
         "- Do not include any email headers (no Subject/From/To/Cc lines)\n"
         "- End with exactly this signature block:\n"
         "Best regards,\n"
