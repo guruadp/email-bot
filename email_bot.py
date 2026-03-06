@@ -4,12 +4,14 @@ import time
 import re
 import html
 import base64
+from datetime import datetime, timezone
 import requests
 import msal
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -44,6 +46,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 TEAMS_CHANNEL_EMAIL = get_required_env("TEAMS_CHANNEL_EMAIL").strip().lower()
 DEV_MODE = get_bool_env("DEV_MODE", default=False)
+ADDRESSING_NAME = os.getenv("ADDRESSING_NAME", "Guru").strip()
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
     "Thanks for your email. I have received it and will get back to you shortly.\n\n"
@@ -131,6 +134,19 @@ def strip_html(text):
     no_tags = re.sub(r"<[^>]+>", " ", text)
     plain = html.unescape(no_tags)
     return re.sub(r"\s+", " ", plain).strip()
+
+
+def format_received_abudhabi(received):
+    if not received:
+        return "(unknown)"
+    try:
+        dt = datetime.fromisoformat(received.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        abu_dhabi_time = dt.astimezone(ZoneInfo("Asia/Dubai"))
+        return abu_dhabi_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return received
 
 
 def sanitize_reply_text(text):
@@ -403,13 +419,25 @@ def is_automated_sender(sender):
     return any(p in sender for p in patterns)
 
 
+def has_direct_greeting_for_name(text, name):
+    if not text or not name:
+        return False
+    snippet = text[:600]
+    escaped_name = re.escape(name.strip())
+    patterns = [
+        rf"\b(?:dear|hello|hi)\s+(?:mr\.?\s+)?{escaped_name}\b",
+        rf"\bgood\s+(?:morning|afternoon|evening)\s*,?\s*(?:mr\.?\s+)?{escaped_name}\b",
+    ]
+    return any(re.search(pattern, snippet, flags=re.IGNORECASE) for pattern in patterns)
+
+
 def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary, outlook_link=""):
     if not TEAMS_CHANNEL_EMAIL:
         return False
 
     safe_sender = html.escape(sender or "unknown")
     safe_subject = html.escape(subject or "(no subject)")
-    safe_received = html.escape(received or "(unknown)")
+    safe_received = html.escape(format_received_abudhabi(received))
     safe_summary = html.escape((ai_summary or "No summary available.").strip()).replace("\n", "<br>")
     open_in_outlook_html = (
         f'<p><a href="{html.escape(outlook_link, quote=True)}">Open email</a></p>'
@@ -509,13 +537,19 @@ def main():
                         )
                     continue
                 try:
+                    full_body = get_full_message_body(session, headers, mid)
+                    if not has_direct_greeting_for_name(full_body, ADDRESSING_NAME):
+                        if DEV_MODE:
+                            print(
+                                f"Skipped: no direct greeting found for '{ADDRESSING_NAME}'."
+                            )
+                        continue
                     thread_context = build_thread_context(
                         session=session,
                         headers=headers,
                         conversation_id=m.get("conversationId"),
                         current_message_id=mid,
                     )
-                    full_body = get_full_message_body(session, headers, mid)
                     reply_text = generate_reply_with_llm(
                         sender=sender,
                         subject=m.get("subject") or "",
