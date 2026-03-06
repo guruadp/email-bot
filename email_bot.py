@@ -47,12 +47,11 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 TEAMS_CHANNEL_EMAIL = get_required_env("TEAMS_CHANNEL_EMAIL").strip().lower()
 DEV_MODE = get_bool_env("DEV_MODE", default=False)
 ADDRESSING_NAME = os.getenv("ADDRESSING_NAME", "Guru").strip()
+EMAIL_SIGNATURE = get_required_env("EMAIL_SIGNATURE").replace("\\n", "\n").strip()
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
     "Thanks for your email. I have received it and will get back to you shortly.\n\n"
-    "Best regards,\n"
-    "Guru\n"
-    "Robotics system Integration Engineer"
+    f"{EMAIL_SIGNATURE}"
 )
 
 
@@ -241,15 +240,17 @@ def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
 
     prompt = (
         "Write a professional email reply draft.\n"
+        "Role and voice:\n"
+        "- You are Guru Nandhan, CEO of Ednex LLC, Ednex Automation, and Maker and Coder\n"
+        "- Write with clear executive tone: confident, concise, strategic, and respectful\n"
+        "- Sound like a CEO responding directly to business stakeholders\n"
         "Requirements:\n"
         "- Keep it concise (80-160 words)\n"
         "- Use the conversation context for continuity when provided\n"
         "- Acknowledge the sender's request\n"
         "- Do not include any email headers (no Subject/From/To/Cc lines)\n"
         "- End with exactly this signature block:\n"
-        "Best regards,\n"
-        "Guru Nandhan\n"
-        "Robotics system Integration Engineer\n"
+        f"{EMAIL_SIGNATURE}\n"
         "- Return plain text only\n\n"
         f"Sender: {sender}\n"
         f"Subject: {subject}\n"
@@ -265,7 +266,9 @@ def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
         "input": [
             {
                 "role": "system",
-                "content": "You draft clear, professional email replies.",
+                "content": (
+                    "You draft clear, professional business email replies in an executive CEO voice."
+                ),
             },
             {
                 "role": "user",
