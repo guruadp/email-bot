@@ -127,6 +127,52 @@ def get_token():
     return result["access_token"]
 
 
+class GraphAuth:
+    def __init__(self, refresh_buffer_seconds=120):
+        self.refresh_buffer_seconds = refresh_buffer_seconds
+        self._token = None
+        self._expires_at = 0
+
+    def _refresh_token(self):
+        session = build_http_session()
+        app = msal.ConfidentialClientApplication(
+            CLIENT_ID,
+            authority=AUTHORITY,
+            client_credential=CLIENT_SECRET,
+            http_client=session,
+        )
+        result = app.acquire_token_for_client(scopes=SCOPES)
+        token = result.get("access_token")
+        if not token:
+            raise RuntimeError(f"Token failed: {json.dumps(result, indent=2)}")
+        expires_in = int(result.get("expires_in") or 3600)
+        self._token = token
+        self._expires_at = time.time() + expires_in
+        return token
+
+    def get_valid_token(self):
+        now = time.time()
+        if (not self._token) or (now >= self._expires_at - self.refresh_buffer_seconds):
+            return self._refresh_token()
+        return self._token
+
+    def get_headers(self):
+        return {"Authorization": f"Bearer {self.get_valid_token()}"}
+
+    def refresh_now(self):
+        return self._refresh_token()
+
+
+def graph_get_with_auth_retry(session, auth, url, params=None, timeout=30):
+    headers = auth.get_headers()
+    resp = session.get(url, headers=headers, params=params, timeout=timeout)
+    if resp.status_code == 401:
+        auth.refresh_now()
+        headers = auth.get_headers()
+        resp = session.get(url, headers=headers, params=params, timeout=timeout)
+    return resp, headers
+
+
 def strip_html(text):
     if not text:
         return ""
@@ -459,9 +505,10 @@ def send_teams_channel_notification(session, headers, sender, subject, received,
 
 
 def main():
-    token = get_token()
+    auth = GraphAuth()
+    token = auth.get_valid_token()
     print_token_diagnostics(token)
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = auth.get_headers()
     session = build_http_session()
     print("LLM mode:", "enabled" if OPENAI_API_KEY else "disabled")
     print("Mailbox mode: app-only auth for", MAILBOX_USER)
@@ -478,7 +525,12 @@ def main():
 
     try:
         # Prime the seen set so existing inbox items are not printed as "new".
-        first = session.get(url, headers=headers, timeout=30)
+        first, headers = graph_get_with_auth_retry(
+            session=session,
+            auth=auth,
+            url=url,
+            timeout=30,
+        )
         raise_for_status_with_details(first, "Initial inbox poll")
         for m in first.json().get("value", []):
             mid = m.get("id")
@@ -488,7 +540,12 @@ def main():
         print(f"Watching inbox for new mail (poll every {POLL_SECONDS}s). Press Ctrl+C to stop.")
 
         while True:
-            r = session.get(url, headers=headers, timeout=30)
+            r, headers = graph_get_with_auth_retry(
+                session=session,
+                auth=auth,
+                url=url,
+                timeout=30,
+            )
             raise_for_status_with_details(r, "Inbox poll")
             items = r.json().get("value", [])
 
