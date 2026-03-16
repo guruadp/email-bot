@@ -15,6 +15,12 @@ from zoneinfo import ZoneInfo
 
 load_dotenv()
 
+
+def log(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+
+
 def get_required_env(name):
     value = os.getenv(name)
     if not value:
@@ -27,6 +33,16 @@ def get_bool_env(name, default=False):
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def infer_addressing_name(mailbox_user):
+    local_part = (mailbox_user or "").split("@", 1)[0].strip()
+    if not local_part:
+        return "Guru"
+    first_part = re.split(r"[._-]+", local_part)[0].strip()
+    if not first_part:
+        return "Guru"
+    return first_part[:1].upper() + first_part[1:]
 
 
 TENANT_ID = get_required_env("TENANT_ID")  # Directory (tenant) ID
@@ -46,7 +62,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 TEAMS_CHANNEL_EMAIL = get_required_env("TEAMS_CHANNEL_EMAIL").strip().lower()
 DEV_MODE = get_bool_env("DEV_MODE", default=False)
-ADDRESSING_NAME = os.getenv("ADDRESSING_NAME", "Guru").strip()
+ADDRESSING_NAME = (os.getenv("ADDRESSING_NAME") or "").strip() or infer_addressing_name(MAILBOX_USER)
 EMAIL_SIGNATURE = get_required_env("EMAIL_SIGNATURE").replace("\\n", "\n").strip()
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
@@ -81,18 +97,13 @@ def decode_jwt_payload(token):
         return {}
 
 
-def print_token_diagnostics(token):
+def warn_if_missing_mail_role(token):
     payload = decode_jwt_payload(token)
     roles = payload.get("roles") or []
-    scp = payload.get("scp")
-
-    print("Token diagnostics:")
-    print("  roles:", roles if roles else "(none)")
-    print("  scp:", scp if scp else "(none)")
 
     if "Mail.ReadWrite" not in roles:
-        print("Warning: token is missing app role 'Mail.ReadWrite'.")
-        print("Check Graph API permissions (Application) and admin consent.")
+        log("Warning: token is missing app role 'Mail.ReadWrite'.")
+        log("Check Graph API permissions (Application) and admin consent.")
 
 
 def build_http_session():
@@ -173,6 +184,21 @@ def graph_get_with_auth_retry(session, auth, url, params=None, timeout=30):
     return resp, headers
 
 
+def poll_inbox(session, auth, url, timeout=30):
+    try:
+        resp, headers = graph_get_with_auth_retry(
+            session=session,
+            auth=auth,
+            url=url,
+            timeout=timeout,
+        )
+        raise_for_status_with_details(resp, "Inbox poll")
+        return resp.json().get("value", []), headers
+    except requests.RequestException as e:
+        log(f"Inbox poll failed: {e}")
+        return None, None
+
+
 def strip_html(text):
     if not text:
         return ""
@@ -244,7 +270,7 @@ def build_thread_context(session, headers, conversation_id, current_message_id=N
         try:
             raise_for_status_with_details(resp, "Fetch thread messages")
         except RuntimeError as e:
-            print(f"Thread context skipped: {e}")
+            log(f"Thread context skipped: {e}")
             return ""
 
     items = resp.json().get("value", [])
@@ -281,7 +307,7 @@ def get_full_message_body(session, headers, message_id):
 
 def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
     if not OPENAI_API_KEY:
-        print("LLM fallback: OPENAI_API_KEY is not set.")
+        log("LLM fallback: OPENAI_API_KEY is not set.")
         return FALLBACK_REPLY_TEXT
 
     prompt = (
@@ -336,7 +362,7 @@ def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
             if text:
                 break
     if not text:
-        print("LLM fallback: model returned empty text.")
+        log("LLM fallback: model returned empty text.")
     return sanitize_reply_text(text) or FALLBACK_REPLY_TEXT
 
 
@@ -498,22 +524,19 @@ def send_teams_channel_notification(session, headers, sender, subject, received,
         return True
     except Exception as e:
         if DEV_MODE:
-            print("Teams channel notification failed:", e)
+            log("Teams channel notification failed:", e)
         else:
-            print("Teams message failed")
+            log("Teams message failed")
         return False
 
 
 def main():
     auth = GraphAuth()
-    token = auth.get_valid_token()
-    print_token_diagnostics(token)
+    warn_if_missing_mail_role(auth.get_valid_token())
     headers = auth.get_headers()
     session = build_http_session()
-    print("LLM mode:", "enabled" if OPENAI_API_KEY else "disabled")
-    print("Mailbox mode: app-only auth for", MAILBOX_USER)
-    print("Teams channel notifications:", "enabled" if TEAMS_CHANNEL_EMAIL else "disabled")
-    print("Dev mode:", "enabled" if DEV_MODE else "disabled")
+    log(f"Email bot started for {MAILBOX_USER}")
+    log(f"Watching inbox every {POLL_SECONDS}s. Greeting name: {ADDRESSING_NAME}")
 
     url = (
         f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/mailFolders/Inbox/messages"
@@ -524,30 +547,28 @@ def main():
     seen_ids = set()
 
     try:
-        # Prime the seen set so existing inbox items are not printed as "new".
-        first, headers = graph_get_with_auth_retry(
-            session=session,
-            auth=auth,
-            url=url,
-            timeout=30,
-        )
-        raise_for_status_with_details(first, "Initial inbox poll")
-        for m in first.json().get("value", []):
-            mid = m.get("id")
-            if mid:
-                seen_ids.add(mid)
-
-        print(f"Watching inbox for new mail (poll every {POLL_SECONDS}s). Press Ctrl+C to stop.")
+        primed = False
 
         while True:
-            r, headers = graph_get_with_auth_retry(
+            items, headers = poll_inbox(
                 session=session,
                 auth=auth,
                 url=url,
                 timeout=30,
             )
-            raise_for_status_with_details(r, "Inbox poll")
-            items = r.json().get("value", [])
+            if items is None:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            if not primed:
+                # Prime the seen set so existing inbox items are not processed as new.
+                for m in items:
+                    mid = m.get("id")
+                    if mid:
+                        seen_ids.add(mid)
+                primed = True
+                time.sleep(POLL_SECONDS)
+                continue
 
             # Show oldest-to-newest among unseen items for readable output order.
             new_items = [m for m in reversed(items) if m.get("id") and m["id"] not in seen_ids]
@@ -555,33 +576,18 @@ def main():
                 mid = m["id"]
                 seen_ids.add(mid)
                 sender = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
-                if DEV_MODE:
-                    print("\n--- New Mail ---")
-                    print("From:", sender)
-                    print("Subject:", m.get("subject"))
-                    print("Received:", m.get("receivedDateTime"))
-                    print("Preview:", (m.get("bodyPreview") or "")[:140])
-                else:
-                    print("Mail received")
                 if is_automated_sender(sender):
-                    if DEV_MODE:
-                        print("Skipped: automated email")
+                    log(f"Skipped automated email from {sender}")
                     continue
                 to_addresses = get_to_addresses(m)
                 if DIRECT_TO_ADDRESS not in to_addresses:
                     if DEV_MODE:
-                        print(
-                            f"Skipped: not directly addressed to {DIRECT_TO_ADDRESS}. "
-                            f"To={to_addresses or ['(none)']}"
-                        )
+                        log(f"Skipped email not directly addressed to {DIRECT_TO_ADDRESS}")
                     continue
                 try:
                     full_body = get_full_message_body(session, headers, mid)
                     if not has_direct_greeting_for_name(full_body, ADDRESSING_NAME):
-                        if DEV_MODE:
-                            print(
-                                f"Skipped: no direct greeting found for '{ADDRESSING_NAME}'."
-                            )
+                        log(f"Skipped email without greeting for {ADDRESSING_NAME}")
                         continue
                     thread_context = build_thread_context(
                         session=session,
@@ -611,24 +617,18 @@ def main():
                         outlook_link=m.get("webLink") or "",
                     )
                     if teams_sent:
-                        print("Teams message sent")
+                        log("Teams message sent")
                     draft_id = create_reply_draft(session, headers, m, reply_text)
                     if draft_id:
-                        if DEV_MODE:
-                            print("Draft reply created:", draft_id)
-                        else:
-                            print("Draft created")
+                        log("Draft created")
                     else:
-                        if DEV_MODE:
-                            print("Draft reply skipped: missing draft id.")
-                        else:
-                            print("Draft skipped")
+                        log("Draft skipped")
                 except (requests.RequestException, RuntimeError) as e:
-                    print("Draft reply failed:", e)
+                    log("Draft reply failed:", e)
 
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
-        print("\nStopped inbox watcher.")
+        log("\nStopped inbox watcher.")
 
 if __name__ == "__main__":
     main()
