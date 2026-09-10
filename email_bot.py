@@ -4,13 +4,14 @@ import time
 import re
 import html
 import base64
+import tempfile
 from datetime import datetime, timezone
 import requests
 import msal
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 load_dotenv()
@@ -56,6 +57,8 @@ SCOPES = ["https://graph.microsoft.com/.default"]
 MAILBOX_USER_ENCODED = quote(MAILBOX_USER, safe="")
 
 POLL_SECONDS = 15
+SEEN_IDS_FILE = os.getenv("SEEN_IDS_FILE", "seen_ids.json")
+SEEN_IDS_RETENTION_DAYS = 30
 MAX_THREAD_MESSAGES = int(os.getenv("MAX_THREAD_MESSAGES", "5"))
 MAX_THREAD_CHARS_PER_MESSAGE = int(os.getenv("MAX_THREAD_CHARS_PER_MESSAGE", "1200"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -64,6 +67,13 @@ TEAMS_CHANNEL_EMAIL = get_required_env("TEAMS_CHANNEL_EMAIL").strip().lower()
 DEV_MODE = get_bool_env("DEV_MODE", default=False)
 ADDRESSING_NAME = (os.getenv("ADDRESSING_NAME") or "").strip() or infer_addressing_name(MAILBOX_USER)
 EMAIL_SIGNATURE = get_required_env("EMAIL_SIGNATURE").replace("\\n", "\n").strip()
+PERSONA_DESCRIPTION = (os.getenv("PERSONA_DESCRIPTION") or "").strip() or (
+    "Guru Nandhan, CEO of Ednex LLC, Ednex Automation, and Maker and Coder"
+)
+VIP_SENDERS = {s.strip().lower() for s in (os.getenv("VIP_SENDERS") or "").split(",") if s.strip()}
+VIP_DOMAINS = {d.strip().lower() for d in (os.getenv("VIP_DOMAINS") or "").split(",") if d.strip()}
+N8N_ACTION_WEBHOOK_URL = (os.getenv("N8N_ACTION_WEBHOOK_URL") or "").strip()
+LINK_EXPIRY_DAYS = int(os.getenv("LINK_EXPIRY_DAYS", "3"))
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
     "Thanks for your email. I have received it and will get back to you shortly.\n\n"
@@ -121,6 +131,33 @@ def build_http_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
+
+def load_seen_ids(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): float(v) for k, v in data.items()}
+    except (FileNotFoundError, ValueError, OSError, TypeError):
+        pass
+    return {}
+
+
+def save_seen_ids(path, seen_ids):
+    cutoff = time.time() - SEEN_IDS_RETENTION_DAYS * 86400
+    pruned = {mid: ts for mid, ts in seen_ids.items() if ts >= cutoff}
+    seen_ids.clear()
+    seen_ids.update(pruned)
+    try:
+        dir_name = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".seen_ids_", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(seen_ids, f)
+        os.replace(tmp_path, path)
+    except OSError as e:
+        log(f"Warning: failed to persist seen_ids: {e}")
+
 
 def get_token():
     session = build_http_session()
@@ -305,7 +342,7 @@ def get_full_message_body(session, headers, message_id):
     return body[:4000]
 
 
-def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
+def generate_reply_with_llm(session, sender, subject, body_text, thread_context=""):
     if not OPENAI_API_KEY:
         log("LLM fallback: OPENAI_API_KEY is not set.")
         return FALLBACK_REPLY_TEXT
@@ -313,7 +350,7 @@ def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
     prompt = (
         "Write a professional email reply draft.\n"
         "Role and voice:\n"
-        "- You are Guru Nandhan, CEO of Ednex LLC, Ednex Automation, and Maker and Coder\n"
+        f"- You are {PERSONA_DESCRIPTION}\n"
         "- Write with clear executive tone: confident, concise, strategic, and respectful\n"
         "- Sound like a CEO responding directly to business stakeholders\n"
         "Requirements:\n"
@@ -348,25 +385,34 @@ def generate_reply_with_llm(sender, subject, body_text, thread_context=""):
             },
         ],
     }
-    resp = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45)
-    resp.raise_for_status()
-    data = resp.json()
-    text = (data.get("output_text") or "").strip()
-    if not text:
-        for item in data.get("output", []):
-            for content in item.get("content", []):
-                if content.get("type") in ("output_text", "text"):
-                    text = (content.get("text") or "").strip()
-                    if text:
-                        break
-            if text:
-                break
-    if not text:
-        log("LLM fallback: model returned empty text.")
-    return sanitize_reply_text(text) or FALLBACK_REPLY_TEXT
+    try:
+        resp = session.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=45,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = (data.get("output_text") or "").strip()
+        if not text:
+            for item in data.get("output", []):
+                for content in item.get("content", []):
+                    if content.get("type") in ("output_text", "text"):
+                        text = (content.get("text") or "").strip()
+                        if text:
+                            break
+                if text:
+                    break
+        if not text:
+            log("LLM fallback: model returned empty text.")
+        return sanitize_reply_text(text) or FALLBACK_REPLY_TEXT
+    except Exception as e:
+        log(f"LLM fallback: reply generation failed: {e}")
+        return FALLBACK_REPLY_TEXT
 
 
-def generate_email_summary_with_llm(sender, subject, body_text, thread_context=""):
+def generate_email_summary_with_llm(session, sender, subject, body_text, thread_context=""):
     fallback = (body_text or "").strip()[:300] or "No summary available."
     if not OPENAI_API_KEY:
         return fallback
@@ -400,7 +446,7 @@ def generate_email_summary_with_llm(sender, subject, body_text, thread_context="
         ],
     }
     try:
-        resp = requests.post(
+        resp = session.post(
             "https://api.openai.com/v1/responses",
             headers=headers,
             json=payload,
@@ -485,7 +531,73 @@ def has_direct_greeting_for_name(text, name):
     return any(re.search(pattern, snippet, flags=re.IGNORECASE) for pattern in patterns)
 
 
-def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary, outlook_link=""):
+def is_vip_sender(sender):
+    sender = (sender or "").strip().lower()
+    if not sender:
+        return False
+    if sender in VIP_SENDERS:
+        return True
+    domain = sender.rsplit("@", 1)[-1] if "@" in sender else ""
+    return domain in VIP_DOMAINS
+
+
+def is_addressed_personally_llm(session, body_text, name):
+    if not OPENAI_API_KEY:
+        return False
+
+    prompt = (
+        f"Email (first 600 chars):\n{(body_text or '')[:600]}\n\n"
+        f"Is this email personally addressed to {name} specifically — written as if "
+        "speaking directly to them, not a mass email, newsletter, CC broadcast, or "
+        "automated notice? Answer with exactly one word: yes or no."
+    )
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [{"role": "user", "content": prompt}],
+    }
+    try:
+        resp = session.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = (data.get("output_text") or "").strip()
+        if not text:
+            for item in data.get("output", []):
+                for content in item.get("content", []):
+                    if content.get("type") in ("output_text", "text"):
+                        text = (content.get("text") or "").strip()
+                        if text:
+                            break
+                if text:
+                    break
+        return text.strip().lower().startswith("y")
+    except Exception as e:
+        log(f"Personal-address LLM check failed, falling back to regex-only: {e}")
+        return False
+
+
+def build_action_link(draft_id, action):
+    if not N8N_ACTION_WEBHOOK_URL or not draft_id:
+        return None
+    expiry = int(time.time()) + LINK_EXPIRY_DAYS * 86400
+    params = {
+        "action": action,
+        "mailbox": MAILBOX_USER,
+        "draft_id": draft_id,
+        "expiry": str(expiry),
+    }
+    return f"{N8N_ACTION_WEBHOOK_URL}?{urlencode(params)}"
+
+
+def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary, outlook_link="", draft_id=None):
     if not TEAMS_CHANNEL_EMAIL:
         return False
 
@@ -498,6 +610,22 @@ def send_teams_channel_notification(session, headers, sender, subject, received,
         if outlook_link
         else ""
     )
+    send_link = build_action_link(draft_id, "send")
+    discard_link = build_action_link(draft_id, "discard")
+    action_buttons_html = ""
+    if send_link and discard_link:
+        button_style = (
+            "display:inline-block;padding:8px 16px;margin-right:8px;"
+            "border-radius:4px;text-decoration:none;font-weight:bold;"
+        )
+        action_buttons_html = (
+            "<p>"
+            f'<a href="{html.escape(send_link, quote=True)}" '
+            f'style="{button_style}background:#107C10;color:#ffffff;">Send Reply</a>'
+            f'<a href="{html.escape(discard_link, quote=True)}" '
+            f'style="{button_style}background:#A80000;color:#ffffff;">Discard Draft</a>'
+            "</p>"
+        )
     url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/sendMail"
     payload = {
         "message": {
@@ -511,6 +639,7 @@ def send_teams_channel_notification(session, headers, sender, subject, received,
                     f"Received: {safe_received}</p>"
                     f"{open_in_outlook_html}"
                     f"<p><strong>AI Summary:</strong><br>{safe_summary}</p>"
+                    f"{action_buttons_html}"
                 ),
             },
             "toRecipients": [{"emailAddress": {"address": TEAMS_CHANNEL_EMAIL}}],
@@ -544,11 +673,16 @@ def main():
         "&$select=id,subject,from,toRecipients,ccRecipients,conversationId,receivedDateTime,bodyPreview,webLink"
     )
 
-    seen_ids = set()
+    seen_ids = load_seen_ids(SEEN_IDS_FILE)
+    # If we loaded persisted state, we already know what's been evaluated
+    # across restarts, so skip re-priming: any unseen item in the current
+    # window gets evaluated immediately, which is what recovers messages
+    # that arrived while the process was down.
+    primed = bool(seen_ids)
+    if primed:
+        log(f"Resumed with {len(seen_ids)} previously-seen message ids from {SEEN_IDS_FILE}")
 
     try:
-        primed = False
-
         while True:
             items, headers = poll_inbox(
                 session=session,
@@ -561,12 +695,14 @@ def main():
                 continue
 
             if not primed:
-                # Prime the seen set so existing inbox items are not processed as new.
+                # First-ever run (no persisted state): prime the seen set so
+                # existing inbox items are not processed as new.
                 for m in items:
                     mid = m.get("id")
                     if mid:
-                        seen_ids.add(mid)
+                        seen_ids[mid] = time.time()
                 primed = True
+                save_seen_ids(SEEN_IDS_FILE, seen_ids)
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -574,7 +710,7 @@ def main():
             new_items = [m for m in reversed(items) if m.get("id") and m["id"] not in seen_ids]
             for m in new_items:
                 mid = m["id"]
-                seen_ids.add(mid)
+                seen_ids[mid] = time.time()
                 sender = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
                 if is_automated_sender(sender):
                     log(f"Skipped automated email from {sender}")
@@ -584,47 +720,76 @@ def main():
                     if DEV_MODE:
                         log(f"Skipped email not directly addressed to {DIRECT_TO_ADDRESS}")
                     continue
+
                 try:
                     full_body = get_full_message_body(session, headers, mid)
-                    if not has_direct_greeting_for_name(full_body, ADDRESSING_NAME):
-                        log(f"Skipped email without greeting for {ADDRESSING_NAME}")
-                        continue
-                    thread_context = build_thread_context(
-                        session=session,
-                        headers=headers,
-                        conversation_id=m.get("conversationId"),
-                        current_message_id=mid,
-                    )
-                    reply_text = generate_reply_with_llm(
-                        sender=sender,
-                        subject=m.get("subject") or "",
-                        body_text=full_body,
-                        thread_context=thread_context,
-                    )
-                    summary_text = generate_email_summary_with_llm(
-                        sender=sender,
-                        subject=m.get("subject") or "",
-                        body_text=full_body,
-                        thread_context=thread_context,
-                    )
-                    teams_sent = send_teams_channel_notification(
-                        session=session,
-                        headers=headers,
-                        sender=sender,
-                        subject=m.get("subject") or "",
-                        received=m.get("receivedDateTime") or "",
-                        ai_summary=summary_text,
-                        outlook_link=m.get("webLink") or "",
-                    )
-                    if teams_sent:
-                        log("Teams message sent")
+                except (requests.RequestException, RuntimeError) as e:
+                    log(f"Failed to fetch message body for {mid}: {e}")
+                    continue
+
+                if is_vip_sender(sender):
+                    pass  # VIP override: always process regardless of greeting shape
+                elif has_direct_greeting_for_name(full_body, ADDRESSING_NAME):
+                    pass  # fast path, no LLM call needed
+                elif is_addressed_personally_llm(session, full_body, ADDRESSING_NAME):
+                    log(f"Personal-address check: LLM confirmed direct address to {ADDRESSING_NAME} (regex missed it)")
+                else:
+                    log(f"Skipped email without greeting for {ADDRESSING_NAME}")
+                    continue
+
+                subject = m.get("subject") or ""
+                thread_context = build_thread_context(
+                    session=session,
+                    headers=headers,
+                    conversation_id=m.get("conversationId"),
+                    current_message_id=mid,
+                )
+
+                summary_text = generate_email_summary_with_llm(
+                    session=session,
+                    sender=sender,
+                    subject=subject,
+                    body_text=full_body,
+                    thread_context=thread_context,
+                )
+                reply_text = generate_reply_with_llm(
+                    session=session,
+                    sender=sender,
+                    subject=subject,
+                    body_text=full_body,
+                    thread_context=thread_context,
+                )
+
+                # Draft creation runs before the Teams notification so a
+                # successful draft_id can be included as Send/Discard action
+                # links. It's wrapped so a failure here still lets the Teams
+                # alert fire below (draft_id=None -> notification just omits
+                # the buttons instead of skipping the alert).
+                try:
                     draft_id = create_reply_draft(session, headers, m, reply_text)
                     if draft_id:
                         log("Draft created")
                     else:
                         log("Draft skipped")
                 except (requests.RequestException, RuntimeError) as e:
-                    log("Draft reply failed:", e)
+                    log(f"Draft creation failed for {mid}: {e}")
+                    draft_id = None
+
+                teams_sent = send_teams_channel_notification(
+                    session=session,
+                    headers=headers,
+                    sender=sender,
+                    subject=subject,
+                    received=m.get("receivedDateTime") or "",
+                    ai_summary=summary_text,
+                    outlook_link=m.get("webLink") or "",
+                    draft_id=draft_id,
+                )
+                if teams_sent:
+                    log("Teams message sent")
+
+            if new_items:
+                save_seen_ids(SEEN_IDS_FILE, seen_ids)
 
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:

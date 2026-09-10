@@ -1,3 +1,10 @@
 .env
+.env_*
 token_cache.bin
+seen_ids.json
+.seen_ids_*.tmp
 __pycache__/
+.venv/
+token_cache_lead.json
+lead_state.json
+leads.xlsx

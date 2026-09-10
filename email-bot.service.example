@@ -1,0 +1,29 @@
+# Template systemd unit for running email_bot.py continuously with
+# automatic restart on crash. Copy, fill in the placeholders, and install:
+#
+#   sudo cp email-bot.service.example /etc/systemd/system/email-bot-senthil.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now email-bot-senthil
+#
+# For a second mailbox (e.g. Guru's), copy again under a different unit
+# name (email-bot-guru.service) pointing at .env_guru and a separate
+# SEEN_IDS_FILE so the two instances don't share state.
+#
+# Logs: journalctl -u email-bot-senthil -f
+
+[Unit]
+Description=Email Bot (Microsoft 365 inbox watcher)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_LINUX_USER
+WorkingDirectory=REPLACE_WITH_ABSOLUTE_PATH_TO_REPO
+EnvironmentFile=REPLACE_WITH_ABSOLUTE_PATH_TO_REPO/.env_senthil
+ExecStart=/usr/bin/python3 REPLACE_WITH_ABSOLUTE_PATH_TO_REPO/email_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

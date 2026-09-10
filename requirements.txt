@@ -1,3 +1,5 @@
 msal
 requests
 python-dotenv
+openai
+openpyxl
