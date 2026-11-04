@@ -8,3 +8,4 @@ __pycache__/
 token_cache_lead.json
 lead_state.json
 leads.xlsx
+google_service_account.json

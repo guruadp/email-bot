@@ -29,6 +29,13 @@ Storage ("storage" in lead_config.json):
                  client flows" = Yes on the app registration.
   "sharepoint" — a workbook on a SharePoint site (app-only, Sites.Selected).
                  Requires IT to grant this app access to the site.
+  "google_sheets" — a Google Sheet (owned by ednexautomation@gmail.com),
+                 written via a Google service account (gspread). Share the
+                 sheet with the service account's email as Editor. Key from
+                 GOOGLE_SERVICE_ACCOUNT_JSON (env, JSON text) or the file
+                 GOOGLE_SERVICE_ACCOUNT_FILE (default google_service_account.json).
+                 The last column, "Zoho Lead ID", is left blank here and filled
+                 by the n8n "Lead Tracker → Zoho CRM" workflow.
 """
 
 import json
@@ -69,6 +76,9 @@ EXCEL_HEADERS = [
 ]
 COL_CLIENT_EMAIL = EXCEL_HEADERS.index("Client Email")
 COL_MESSAGE_ID = EXCEL_HEADERS.index("Message ID")
+# Google Sheet only: one extra column at the end, filled in by n8n after the
+# lead is created in Zoho CRM. This bot never writes to it.
+SHEET_HEADERS = EXCEL_HEADERS + ["Zoho Lead ID"]
 
 EXTRACTION_SCHEMA = {
     "name": "lead_extraction",
@@ -398,6 +408,90 @@ class GraphExcelStore:
         return f"{self.label}:{self.file_path}"
 
 
+class GoogleSheetStore:
+    """A Google Sheet written via a Google service account (gspread).
+
+    The sheet lives in ednexautomation@gmail.com's Drive and must be shared
+    with the service account's client_email as Editor. Rows are appended
+    immediately (RAW, so email text is never interpreted as a formula).
+    """
+
+    def __init__(self, cfg):
+        try:
+            import gspread
+        except ImportError:
+            sys.exit("gspread is not installed. Run: pip install -r requirements.txt")
+        self._gspread = gspread
+
+        raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+        if raw:
+            info = json.loads(raw)
+            gc = gspread.service_account_from_dict(info)
+        else:
+            key_path = BASE_DIR / os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "google_service_account.json")
+            if not key_path.exists():
+                sys.exit(
+                    f"Google service account key not found ({key_path.name}).\n"
+                    "Set GOOGLE_SERVICE_ACCOUNT_JSON, or add the key file (on Render: a Secret File)."
+                )
+            info = json.loads(key_path.read_text())
+            gc = gspread.service_account(filename=str(key_path))
+        sa_email = info.get("client_email", "the service account")
+
+        sheet_id = (cfg.get("spreadsheet_id") or "").strip()
+        if not sheet_id or sheet_id.startswith("PASTE_"):
+            sys.exit("Set google_sheets.spreadsheet_id in lead_config.json (the ID from the sheet's URL).")
+        try:
+            sh = gc.open_by_key(sheet_id)
+        except (gspread.exceptions.SpreadsheetNotFound, gspread.exceptions.APIError) as exc:
+            sys.exit(
+                f"Cannot open Google Sheet {sheet_id}: {exc}\n"
+                f"Share the sheet with {sa_email} as Editor, and check the Google Sheets API\n"
+                "is enabled in the service account's Google Cloud project."
+            )
+
+        name = (cfg.get("worksheet") or "").strip()
+        if name:
+            try:
+                ws = sh.worksheet(name)
+            except gspread.exceptions.WorksheetNotFound:
+                ws = sh.add_worksheet(title=name, rows=1000, cols=len(SHEET_HEADERS))
+        else:
+            ws = sh.sheet1
+        self.ws = ws
+        self.label = f"Google Sheet:{sh.title}/{ws.title}"
+
+        values = ws.get_all_values()
+        if not values or not any(cell.strip() for cell in values[0]):
+            ws.update(values=[SHEET_HEADERS], range_name="A1")
+            ws.freeze(rows=1)
+            print(f"Wrote header row to {self.label}.", flush=True)
+            values = [SHEET_HEADERS]
+        elif values[0][:len(EXCEL_HEADERS)] != EXCEL_HEADERS:
+            print(f"Warning: header row in {self.label} differs from the expected columns; "
+                  "rows are still appended in the standard order.", flush=True)
+
+        rows = values[1:]
+        self.message_ids = {r[COL_MESSAGE_ID] for r in rows
+                            if len(r) > COL_MESSAGE_ID and r[COL_MESSAGE_ID]}
+        self.client_emails = {r[COL_CLIENT_EMAIL].lower() for r in rows
+                              if len(r) > COL_CLIENT_EMAIL and r[COL_CLIENT_EMAIL]}
+
+    def append(self, row):
+        self.ws.append_row(
+            [str(v) if v is not None else "" for v in row],
+            value_input_option="RAW",
+            insert_data_option="INSERT_ROWS",
+            table_range="A1",
+        )
+
+    def flush(self):
+        pass  # rows are written immediately
+
+    def describe(self):
+        return self.label
+
+
 def make_onedrive_store(cfg):
     """Workbook in the signed-in user's own OneDrive (delegated auth, no IT grant)."""
     token = get_delegated_token()
@@ -460,6 +554,8 @@ def run_once():
         store = make_onedrive_store(config["onedrive"])
     elif storage == "sharepoint":
         store = make_sharepoint_store(token, config["sharepoint"])
+    elif storage == "google_sheets":
+        store = GoogleSheetStore(config["google_sheets"])
     else:
         store = LocalExcelStore(BASE_DIR / config["excel_file"])
 

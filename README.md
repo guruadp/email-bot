@@ -24,7 +24,7 @@ If checks pass, it sends Teams notification and creates a reply draft.
 | File | What it does |
 |---|---|
 | `email_bot.py` | The inbox watcher: polls the mailbox every 15 s, sends Teams notifications with AI summaries, creates LLM reply drafts. |
-| `lead_automation.py` | The lead tracker: classifies Sales-mailbox emails with an LLM, extracts lead details, appends them to the Excel tracker in OneDrive. Runs one cycle and exits. See "Lead automation" below. |
+| `lead_automation.py` | The lead tracker: classifies Sales-mailbox emails with an LLM, extracts lead details, appends them to the lead tracker (Google Sheet by default; OneDrive/SharePoint/local Excel also supported). Runs one cycle and exits. See "Lead automation" below. |
 | `start.py` | Production entry point: runs `email_bot.py` continuously (auto-restart on crash) and a `lead_automation.py` cycle every `LEAD_POLL_MINUTES` (default 15). This is the Render start command. |
 | `lead_config.json` | Lead automation settings: mailbox, storage mode, lead-sender whitelist, confidence threshold, Ednex product catalog. |
 | `requirements.txt` | Python dependencies for both bots. |
@@ -202,6 +202,34 @@ restarts it if it crashes, and runs one `lead_automation.py` cycle every
   the **Lead-Email-Automation** app registration (separate from the email-bot
   app, hence the prefix); `LEAD_TENANT_ID` falls back to `TENANT_ID`;
   `OPENAI_API_KEY` is shared.
+
+### Google Sheet tracker (default, `"storage": "google_sheets"`)
+
+Leads are appended to a Google Sheet owned by `ednexautomation@gmail.com`,
+written with a Google **service account** (a robot Google identity — no
+browser sign-in, no token expiry, no Microsoft/IT consent).
+
+One-time setup:
+
+1. In Google Cloud Console (signed in as ednexautomation@gmail.com): create a
+   project, enable the **Google Sheets API**, create a **service account**,
+   and download a **JSON key** for it.
+2. Create a blank Google Sheet, then **Share** it with the service account's
+   `client_email` (inside the JSON key) as **Editor**.
+3. Put the sheet ID (the long part of the URL between `/d/` and `/edit`) in
+   `lead_config.json` → `google_sheets.spreadsheet_id`.
+4. Locally: save the key as `google_service_account.json` (gitignored). On
+   Render: add it as a **Secret File** with that exact name.
+
+The bot writes the header row on the first run. The last column,
+**Zoho Lead ID**, is never written by the bot: the n8n workflow
+**Lead Tracker → Zoho CRM** fills it in after creating the lead in Zoho, so
+an empty cell means "not in Zoho yet".
+
+Don't insert or reorder columns in the sheet — the bot appends values in a
+fixed order. Adding columns to the right of Zoho Lead ID is fine.
+
+To switch back to OneDrive, set `"storage": "onedrive"`.
 
 ### OneDrive sign-in (`token_cache_lead.json`)
 
