@@ -4,3 +4,4 @@ python-dotenv
 openai
 openpyxl
 gspread>=6
+pypdf>=4

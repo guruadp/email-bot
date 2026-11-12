@@ -8,16 +8,60 @@ Python inbox watcher for Microsoft 365 that:
 ## Behavior
 
 For each new inbox message, the bot will process it only when all checks pass:
-1. sender is not likely automated (`noreply`, `notification`, etc.),
-2. your mailbox address is directly in `To:`,
-3. the sender is on the VIP list (`VIP_SENDERS`/`VIP_DOMAINS`, always processed), **or** the email
+1. it isn't from the mailbox itself, a meeting response, or in `SKIP_SENDERS`/`SKIP_DOMAINS`,
+2. sender is not likely automated (`noreply`, `notification`, `systemgenerated`, `newsletter`,
+   `marketing`, etc.),
+3. your mailbox address is directly in `To:`,
+4. it isn't bulk mail: no `List-Unsubscribe`, `List-Id`, `Precedence: bulk` or `Auto-Submitted` header,
+5. the sender is on the VIP list (`VIP_SENDERS`/`VIP_DOMAINS`, always processed), **or** the email
    body includes a direct greeting to `ADDRESSING_NAME` (examples: `Dear Guru`, `Hi Guru`, `Hello Guru`,
    `Dear Mr. Guru`, `Good morning Guru`), **or**, when the greeting regex doesn't match and an
    `OPENAI_API_KEY` is configured, an LLM call confirms the email is genuinely addressed to
    `ADDRESSING_NAME` personally (catches phrasing like `Senthil, following up on...` or a threaded
-   reply with no greeting at all, which the regex alone would miss).
+   reply with no greeting at all, which the regex alone would miss),
+6. an LLM classifies it as **personal**, not **marketing** (promotions, event invitations, cold sales
+   pitches, even when they greet you by name) or **automated** (alerts, receipts, statements).
 
-If checks pass, it sends Teams notification and creates a reply draft.
+Checks 4 and 6 (`MARKETING_FILTER`) are skipped for VIP senders and for threads the mailbox owner has
+already replied in, so an ongoing conversation is never filtered out.
+
+If checks pass, it reads any attachments, sends a Teams notification and creates a reply draft. The
+draft keeps the original email quoted below the reply, like Outlook's Reply All.
+
+### Writing style (`STYLE_LEARNING`)
+
+Once a day the bot reads the last `STYLE_SAMPLE_SIZE` emails in Sent Items, has the LLM describe how
+the owner writes (greeting, length, tone, phrasing), and uses that description plus two short real
+examples when drafting. Known limitation: drafts the owner sent unedited are in Sent Items too, so
+the bot partly learns from its own past drafts.
+
+### Attachments (`ATTACHMENTS_ENABLED`)
+
+Text is read from up to 5 PDF, Word (`.docx`), Excel (`.xlsx`) and text attachments per email
+(`ATTACHMENT_MAX_MB` each, `ATTACHMENT_MAX_CHARS` in total) and given to the summary and the reply.
+The Teams notification lists the attachment names. Scanned PDFs (images with no text layer) and
+old `.doc`/`.xls` files are not read.
+
+### Follow-up digest (`FOLLOWUP_ENABLED`)
+
+Every day at `FOLLOWUP_DIGEST_HOUR` (Dubai time) the bot posts one Teams message listing emails the
+owner sent `FOLLOWUP_AFTER_DAYS`–`FOLLOWUP_LOOKBACK_DAYS` days ago that still have no reply. It only
+counts emails to outside recipients (not `FOLLOWUP_IGNORE_DOMAINS`, default the mailbox's own domain),
+that the LLM judges to expect a reply, and whose conversation has no later message from anyone.
+The last-sent date is kept in `FOLLOWUP_STATE_FILE`; on Render it resets on deploy, so a deploy
+during the digest hour can send that day's digest twice.
+
+### Read-only previews
+
+Check each feature against the real mailbox without creating drafts or Teams messages (LLM calls
+are still made):
+
+```bash
+python3 email_bot.py --check-filter 50        # draft/skip decision + reason for the last 50 inbox emails
+python3 email_bot.py --preview-style          # the learned writing style
+python3 email_bot.py --preview-followups      # what today's follow-up digest would list
+python3 email_bot.py --preview-attachments 50 # text read from attachments in the last 50 inbox emails
+```
 
 ## Files
 
