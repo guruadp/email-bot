@@ -110,6 +110,39 @@ FOLLOWUP_IGNORE_DOMAINS = get_list_env("FOLLOWUP_IGNORE_DOMAINS", MAILBOX_DOMAIN
 FOLLOWUP_STATE_FILE = os.getenv("FOLLOWUP_STATE_FILE", "followup_state.json")
 FOLLOWUP_MAX_ITEMS = 25
 
+# Detect tenders/RFQs and finance/legal matters, flag them in Outlook and alert Teams.
+TRACKING_ENABLED = get_bool_env("TRACKING_ENABLED", default=True)
+FINANCE_SENDER_DOMAINS = get_list_env(
+    "FINANCE_SENDER_DOMAINS",
+    "adcb.com,dbs.com,adib.ae,emiratesnbd.com,bankfab.com,fab.ae,mashreq.com,rakbank.ae,cbd.ae,"
+    "hsbc.ae,icici.bank.in,icicibank.com,nesl.co.in,gov.ae",
+)
+
+# Daily Teams briefing (includes the follow-up list, replacing the separate digest).
+BRIEFING_ENABLED = get_bool_env("BRIEFING_ENABLED", default=True)
+BRIEFING_HOUR = int(os.getenv("BRIEFING_HOUR", "8"))  # Dubai time
+
+# Finance/legal details are confidential: they are never written to a sheet, and
+# their Teams alerts can go to a separate private channel or address. When this
+# differs from TEAMS_CHANNEL_EMAIL, the shared briefing only shows a count.
+FINANCE_ALERT_EMAIL = (os.getenv("FINANCE_ALERT_EMAIL") or "").strip().lower() or TEAMS_CHANNEL_EMAIL
+FINANCE_IS_PRIVATE = FINANCE_ALERT_EMAIL != TEAMS_CHANNEL_EMAIL
+
+
+def default_tender_sheet_id():
+    """The lead tracker's Google Sheet (lead_config.json), so tenders get a tab next to Leads."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lead_config.json"), encoding="utf-8") as f:
+            return ((json.load(f).get("google_sheets") or {}).get("spreadsheet_id") or "").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+# Tenders (never finance) are also kept in a "Tenders" tab of the lead Google Sheet.
+TENDER_SHEET_ENABLED = get_bool_env("TENDER_SHEET_ENABLED", default=True)
+TENDER_SHEET_ID = (os.getenv("TENDER_SHEET_ID") or "").strip() or default_tender_sheet_id()
+TENDER_SHEET_TAB = (os.getenv("TENDER_SHEET_TAB") or "Tenders").strip()
+
 GRAPH_USER_URL = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}"
 FALLBACK_REPLY_TEXT = (
     "Hi,\n\n"
@@ -368,7 +401,7 @@ def build_thread_context(session, headers, conversation_id, current_message_id=N
 def get_message_details(session, headers, message_id):
     """Body text (first 4000 chars), internet headers and attachment flag for one message."""
     url = f"{GRAPH_USER_URL}/messages/{message_id}"
-    params = {"$select": "body,bodyPreview,internetMessageHeaders,hasAttachments"}
+    params = {"$select": "body,bodyPreview,internetMessageHeaders,hasAttachments,categories"}
     resp = session.get(url, headers=headers, params=params, timeout=30)
     raise_for_status_with_details(resp, "Fetch message body")
     data = resp.json()
@@ -382,16 +415,21 @@ def get_message_details(session, headers, message_id):
         "body": body[:4000],
         "internet_headers": data.get("internetMessageHeaders") or [],
         "has_attachments": bool(data.get("hasAttachments")),
+        "categories": data.get("categories") or [],
     }
 
 
-def llm_text(session, messages, timeout=30):
+def llm_text(session, messages, timeout=30, json_mode=False):
     """Call the OpenAI Responses API and return its text output ("" if empty).
+    json_mode asks for a JSON object (the prompt must mention JSON).
     Raises on HTTP or network errors; callers decide the fallback."""
+    payload = {"model": OPENAI_MODEL, "input": messages}
+    if json_mode:
+        payload["text"] = {"format": {"type": "json_object"}}
     resp = session.post(
         "https://api.openai.com/v1/responses",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json={"model": OPENAI_MODEL, "input": messages},
+        json=payload,
         timeout=timeout,
     )
     resp.raise_for_status()
@@ -1150,6 +1188,536 @@ def maybe_send_followup_digest(session, auth, state, cache):
         log(f"Follow-up digest failed: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Tender / RFQ and finance / legal tracking
+# ---------------------------------------------------------------------------
+
+# Extracted details are stored on the email itself (a custom MAPI property),
+# so the tracker survives restarts and needs no extra storage or permissions.
+TRACKING_PROPERTY_ID = "String {5b2f8c3e-7a41-4d0e-9c63-1e8f2a6b4d57} Name EdnexBotTracking"
+TRACK_CATEGORIES = {"tender": "Tender", "finance": "Finance", "legal": "Legal"}
+TENDER_KEYWORDS = re.compile(
+    r"\b(tender|rfq|rfp|rfi|request for (quotation|quote|proposal|information)|quotation request|"
+    r"bid|bidding|negotiation|sourcing event|e-?sourcing|procurement|invited to (participate|submit|bid)|"
+    r"submission (deadline|date)|closing date|pre-?bid|clarification)\b",
+    re.IGNORECASE,
+)
+FINANCE_KEYWORDS = re.compile(
+    r"\b(payment|overdue|outstanding|past due|due date|is due|amount due|invoice|guarantee|emi|loan|"
+    r"default|penalt(y|ies)|fines?|legal|court|lawsuit|notice|vat|tax|fta|refund|debit|cheque|bounced|"
+    r"suspend|suspension|termination|breach|remittance|letter of credit|contract)\b",
+    re.IGNORECASE,
+)
+
+
+def is_finance_domain(domain):
+    domain = (domain or "").lower()
+    return any(domain == d or domain.endswith("." + d) for d in FINANCE_SENDER_DOMAINS)
+
+
+def tracking_candidate_kind(m):
+    """Cheap keyword pre-check before any LLM call. Returns 'tender', 'finance' or None.
+    Only email with the mailbox in To or Cc is considered."""
+    sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "").lower()
+    if not sender or sender == DIRECT_TO_ADDRESS or "systemgenerated" in sender:
+        return None
+    recipients = {
+        ((r.get("emailAddress") or {}).get("address") or "").lower()
+        for r in (m.get("toRecipients") or []) + (m.get("ccRecipients") or [])
+    }
+    if DIRECT_TO_ADDRESS not in recipients:
+        return None
+    text = f"{m.get('subject') or ''} {m.get('bodyPreview') or ''}"
+    if TENDER_KEYWORDS.search(text):
+        return "tender"
+    if FINANCE_KEYWORDS.search(text) or is_finance_domain(sender.rsplit("@", 1)[-1]):
+        return "finance"
+    return None
+
+
+def parse_local_deadline(value):
+    """'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD' in Dubai time -> aware datetime, else None."""
+    value = (value or "").strip().replace("T", " ")
+    for fmt, has_time in (("%Y-%m-%d %H:%M", True), ("%Y-%m-%d", False)):
+        try:
+            dt = datetime.strptime(value[:16] if has_time else value[:10], fmt)
+        except ValueError:
+            continue
+        if not has_time:
+            dt = dt.replace(hour=23, minute=59)
+        return dt.replace(tzinfo=LOCAL_TZ)
+    return None
+
+
+def extract_tracking_llm(session, sender, subject, body_text, attachments_text=""):
+    """Ask the LLM whether this is a tender, finance or legal matter and extract the
+    details. Returns a dict, or None if the call fails or the answer is unusable."""
+    if not OPENAI_API_KEY:
+        return None
+    today = datetime.now(LOCAL_TZ).strftime("%A %d %B %Y, %H:%M")
+    prompt = (
+        f"Today is {today} (Dubai time). You help {PERSONA_DESCRIPTION} keep track of tenders and "
+        "money or legal matters. Read the email and answer with a JSON object only:\n"
+        '{"kind": "tender"|"finance"|"legal"|"none", "important": true|false, "title": "", '
+        '"organization": "", "reference": "", "amount": "", "deadline": "", "stage": "", '
+        '"action": "", "summary": "", "link": ""}\n'
+        "Rules:\n"
+        "- tender: an invitation to bid or quote (tender, RFQ, RFP, negotiation or sourcing event), or an "
+        "update on one: amendment, clarification, deadline change, reminder, award or rejection. "
+        "important=true if it is a new opportunity, sets or changes a deadline, asks the company to do "
+        "something, or announces a result. important=false for automatic receipts confirming a quote that "
+        "was already submitted, and for internal chatter that adds nothing new.\n"
+        "- finance: money owed by or to the company, or a bank matter: payment due or overdue, unpaid "
+        "invoices, bank guarantees, loans/EMI, failed or bounced payments, fines or penalties, tax/VAT "
+        "notices, account restrictions. important=true only if someone must act or money is at risk. "
+        "Routine statements, receipts, successful-transfer or validation confirmations, promotions and "
+        "webinars are important=false.\n"
+        "- legal: legal notices, contracts needing signature or review, disputes, court or regulatory "
+        "matters, compliance deadlines. important=true if action is needed.\n"
+        "- none: anything else, including marketing, newsletters, events and general sales.\n"
+        "- deadline: the submission, payment or response deadline as 'YYYY-MM-DD HH:MM' in Dubai time if "
+        "stated (resolve relative dates from today); empty if none.\n"
+        "- stage (tenders only): invitation, amendment, clarification, reminder, submitted, award, "
+        "rejection or other.\n"
+        f"- action: what {ADDRESSING_NAME} needs to do, max 15 words. summary: one sentence, max 30 words. "
+        "Keep amounts with their currency. link: a portal or submission URL from the email, if any. "
+        "Never invent details that are not in the email.\n\n"
+        f"Sender: {sender}\nSubject: {subject}\nEmail:\n{(body_text or '')[:4000]}\n\n"
+        f"Attachments (extracted text, if any):\n{(attachments_text or '(none)')[:3000]}"
+    )
+    try:
+        raw = llm_text(session, [{"role": "user", "content": prompt}], timeout=45, json_mode=True)
+        data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+    except Exception as e:
+        log(f"Tracking extraction failed: {e}")
+        return None
+    kind = str(data.get("kind") or "none").lower()
+    if kind not in TRACK_CATEGORIES:
+        kind = "none"
+    info = {k: str(data.get(k) or "").strip()[:300] for k in
+            ("title", "organization", "reference", "amount", "deadline", "stage", "action", "summary", "link")}
+    info["kind"] = kind
+    important = data.get("important")
+    info["important"] = important is True or str(important).lower() == "true"
+    if not parse_local_deadline(info["deadline"]):
+        info["deadline"] = ""
+    return info
+
+
+def mark_in_outlook(session, headers, message_id, info, existing_categories):
+    """Flag the email (due date = deadline, if in the future), add the Tender/Finance/Legal
+    category, and store the extracted details on it for the morning briefing."""
+    category = TRACK_CATEGORIES[info["kind"]]
+    flag = {"flagStatus": "flagged"}
+    deadline = parse_local_deadline(info.get("deadline"))
+    if deadline and deadline > datetime.now(LOCAL_TZ):
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        flag["startDateTime"] = {"dateTime": datetime.now(timezone.utc).strftime(fmt), "timeZone": "UTC"}
+        flag["dueDateTime"] = {"dateTime": deadline.astimezone(timezone.utc).strftime(fmt), "timeZone": "UTC"}
+    body = {
+        "categories": list(dict.fromkeys(list(existing_categories or []) + [category])),
+        "flag": flag,
+        "singleValueExtendedProperties": [{"id": TRACKING_PROPERTY_ID, "value": json.dumps(info)}],
+    }
+    resp = session.patch(
+        f"{GRAPH_USER_URL}/messages/{message_id}",
+        headers={**headers, "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    raise_for_status_with_details(resp, "Flag tracked email")
+
+
+def track_email(session, headers, m, details, state, mark=True, tender_sheet=None):
+    """Detect a tender/RFQ or finance/legal matter in inbox message m.
+    Returns (info or None, details). details may be fetched here; it caches any
+    attachment text under details['attachments'] for reuse by the reply draft."""
+    kind = tracking_candidate_kind(m)
+    if not kind:
+        return None, details
+    if details is None:
+        details = get_message_details(session, headers, m["id"])
+    sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
+    bulk = bulk_header_reason(details["internet_headers"])
+    if bulk and not is_finance_domain(sender.lower().rsplit("@", 1)[-1]):
+        return None, details  # newsletters about tax/tenders are not actual matters
+    attachments_text = ""
+    if ATTACHMENTS_ENABLED and details["has_attachments"]:
+        try:
+            details["attachments"] = get_attachments_text(session, headers, m["id"])
+            attachments_text = details["attachments"][0]
+        except (requests.RequestException, RuntimeError) as e:
+            log(f"Attachments skipped for tracking: {e}")
+    info = extract_tracking_llm(session, sender, m.get("subject") or "", details["body"], attachments_text)
+    if not info or info["kind"] == "none" or not info["important"]:
+        return None, details
+
+    if mark:
+        try:
+            mark_in_outlook(session, headers, m["id"], info, details.get("categories"))
+        except (requests.RequestException, RuntimeError) as e:
+            log(f"Could not flag tracked email: {e}")
+        if tender_sheet is not None and info["kind"] == "tender":  # finance/legal never go to a sheet
+            try:
+                tender_sheet.upsert(info, m)
+            except Exception as e:
+                log(f"Tender sheet update failed: {e}")
+
+    # One alert per tender reference/stage (or finance item) per day: Oracle sourcing
+    # sends several emails for the same negotiation.
+    key = "|".join([info["kind"], (info["reference"] or info["title"] or m.get("subject") or "").lower(), info["stage"]])
+    alerted = state.setdefault("alerted", {})
+    now = time.time()
+    for k in [k for k, t in alerted.items() if now - t > 7 * 86400]:
+        del alerted[k]
+    info["duplicate"] = now - alerted.get(key, 0) < 86400
+    if not info["duplicate"] and mark:
+        alerted[key] = now
+        save_followup_state(state)
+    return info, details
+
+
+TENDER_HEADERS = [
+    "First seen", "Last update", "Organization", "Title", "Reference", "Stage",
+    "Deadline (Dubai)", "Action", "Summary", "Portal link", "Email link",
+    "Ednex status", "Notes",
+]
+TENDER_BOT_COLUMNS = 11  # the bot writes A..K; "Ednex status" and "Notes" are for people
+
+
+def column_letter(n):
+    return chr(ord("A") + n - 1)
+
+
+class TenderSheet:
+    """The 'Tenders' tab in the lead Google Sheet: one row per tender (matched on
+    Reference, else Title), updated as new emails about it arrive. Opened lazily;
+    if the Google key or sheet is unavailable it logs once and stays off, and
+    tracking in Outlook carries on."""
+
+    def __init__(self):
+        self.ws = None
+        self.disabled = not (TENDER_SHEET_ENABLED and TENDER_SHEET_ID)
+
+    def _open(self):
+        if self.ws is not None or self.disabled:
+            return self.ws
+        try:
+            import gspread
+
+            raw = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+            if raw:
+                gc = gspread.service_account_from_dict(json.loads(raw))
+            else:
+                key_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "google_service_account.json")
+                if not os.path.isabs(key_path):
+                    key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), key_path)
+                if not os.path.exists(key_path):
+                    raise RuntimeError(f"Google service account key not found ({os.path.basename(key_path)})")
+                gc = gspread.service_account(filename=key_path)
+            sh = gc.open_by_key(TENDER_SHEET_ID)
+            try:
+                ws = sh.worksheet(TENDER_SHEET_TAB)
+            except gspread.exceptions.WorksheetNotFound:
+                ws = sh.add_worksheet(title=TENDER_SHEET_TAB, rows=1000, cols=len(TENDER_HEADERS))
+            first = ws.row_values(1)
+            if not any(c.strip() for c in first):
+                ws.update(values=[TENDER_HEADERS], range_name="A1")
+                ws.freeze(rows=1)
+            self.ws = ws
+        except Exception as e:
+            self.disabled = True
+            log(f"Tender sheet disabled (tracking in Outlook continues): {e}")
+        return self.ws
+
+    def upsert(self, info, m):
+        ws = self._open()
+        if ws is None:
+            return
+        now = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+        new = [
+            now, now, info.get("organization", ""), info.get("title", ""), info.get("reference", ""),
+            info.get("stage", ""), info.get("deadline", ""), info.get("action", ""), info.get("summary", ""),
+            info.get("link", ""), m.get("webLink") or "",
+        ]
+        rows = ws.get_all_values()
+        ref = (info.get("reference") or "").strip().lower()
+        title = (info.get("title") or "").strip().lower()
+        for idx, row in enumerate(rows[1:], start=2):
+            row = (row + [""] * TENDER_BOT_COLUMNS)[:TENDER_BOT_COLUMNS]
+            if (ref and row[4].strip().lower() == ref) or (not ref and title and row[3].strip().lower() == title):
+                merged = [row[0]] + [n if n else old for n, old in zip(new[1:], row[1:])]
+                ws.update(values=[merged], range_name=f"A{idx}:{column_letter(TENDER_BOT_COLUMNS)}{idx}",
+                          value_input_option="RAW")
+                return
+        ws.append_row(new, value_input_option="RAW", insert_data_option="INSERT_ROWS", table_range="A1")
+
+
+def describe_deadline(deadline_text):
+    deadline = parse_local_deadline(deadline_text)
+    if not deadline:
+        return ""
+    days = (deadline.date() - datetime.now(LOCAL_TZ).date()).days
+    when = deadline.strftime("%a %d %b %Y, %H:%M")
+    if days < 0:
+        return f"{when} (passed)"
+    if days == 0:
+        return f"{when} (TODAY)"
+    return f"{when} (in {days} day{'s' if days != 1 else ''})"
+
+
+def build_tracking_html(info, heading=True):
+    """HTML block with the extracted tender/finance/legal details."""
+    icon = {"tender": "📋", "finance": "💰", "legal": "⚖️"}[info["kind"]]
+    label = {"tender": "Tender / RFQ", "finance": "Finance alert", "legal": "Legal notice"}[info["kind"]]
+    rows = [
+        ("Organization", info.get("organization")),
+        ("Reference", info.get("reference")),
+        ("Stage", info.get("stage") if info["kind"] == "tender" else ""),
+        ("Amount", info.get("amount")),
+        ("Deadline", describe_deadline(info.get("deadline"))),
+        ("Action", info.get("action")),
+        ("Summary", info.get("summary")),
+    ]
+    lines = "".join(f"{name}: {html.escape(value)}<br>" for name, value in rows if value)
+    link = info.get("link") or ""
+    if link.startswith(("http://", "https://")):
+        lines += f'Portal: <a href="{html.escape(link, quote=True)}">{html.escape(link[:80])}</a><br>'
+    title = f"<p><strong>{icon} {label}: {html.escape(info.get('title') or '')}</strong></p>" if heading else ""
+    return f"{title}<p>{lines}</p>"
+
+
+def send_tracking_alert(session, headers, m, info):
+    sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "unknown")
+    label = {"tender": "Tender/RFQ", "finance": "Finance alert", "legal": "Legal notice"}[info["kind"]]
+    link = m.get("webLink") or ""
+    open_link = f'<p><a href="{html.escape(link, quote=True)}">Open email</a></p>' if link else ""
+    return send_teams_html(
+        session,
+        headers,
+        f"{label}: {info.get('title') or m.get('subject') or ''}"[:250],
+        build_tracking_html(info)
+        + f"<p>From: {html.escape(sender)}<br>Subject: {html.escape(m.get('subject') or '')}<br>"
+        f"Received: {html.escape(format_received_abudhabi(m.get('receivedDateTime')))}</p>"
+        + open_link
+        + "<p><em>Flagged in Outlook. Mark the flag complete when it's handled.</em></p>",
+        to=FINANCE_ALERT_EMAIL if info["kind"] in ("finance", "legal") else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Morning briefing
+# ---------------------------------------------------------------------------
+
+def fetch_tracked_items(session, headers, days=60):
+    """Open (still flagged) emails the bot tracked in the last `days` days."""
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = {
+        "$filter": f"flag/flagStatus eq 'flagged' and receivedDateTime ge {start}",
+        "$select": "id,subject,from,receivedDateTime,webLink",
+        "$expand": f"singleValueExtendedProperties($filter=id eq '{TRACKING_PROPERTY_ID}')",
+        "$top": "100",
+    }
+    items = []
+    for m in graph_get_all(session, headers, f"{GRAPH_USER_URL}/messages", params, limit=1000):
+        # Graph also returns Outlook's own flag-status property here, so match ours by ID.
+        ours = [
+            p for p in m.get("singleValueExtendedProperties") or []
+            if (p.get("id") or "").lower() == TRACKING_PROPERTY_ID.lower()
+        ]
+        if not ours:
+            continue  # flagged by a person, not by the bot
+        try:
+            info = json.loads(ours[0].get("value") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(info, dict) or info.get("kind") not in TRACK_CATEGORIES:
+            continue
+        info["email_link"] = m.get("webLink") or ""
+        info["received"] = m.get("receivedDateTime") or ""
+        info["subject"] = m.get("subject") or ""
+        items.append(info)
+    return items
+
+
+def find_unreviewed_drafts(session, headers, hours=24):
+    """Reply drafts created in the last `hours` hours that haven't been sent yet."""
+    start = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    drafts = graph_get_all(
+        session, headers, f"{GRAPH_USER_URL}/mailFolders/drafts/messages",
+        {
+            "$filter": f"createdDateTime ge {start}",
+            "$orderby": "createdDateTime desc",
+            "$select": "subject,toRecipients,createdDateTime,webLink",
+            "$top": "50",
+        },
+        limit=50,
+    )
+    return [
+        {
+            "to": ", ".join(
+                (r.get("emailAddress") or {}).get("name") or (r.get("emailAddress") or {}).get("address", "")
+                for r in (d.get("toRecipients") or [])[:2]
+            ),
+            "subject": d.get("subject") or "(no subject)",
+            "link": d.get("webLink") or "",
+        }
+        for d in drafts
+        if (d.get("subject") or "").lower().startswith("re:")
+        and not all(  # drafts that only answer automated senders aren't worth reviewing
+            is_automated_sender((r.get("emailAddress") or {}).get("address"))
+            for r in (d.get("toRecipients") or [{}])
+        )
+    ]
+
+
+def collect_briefing(session, headers, followup_cache=None):
+    now = datetime.now(LOCAL_TZ)
+    tracked = fetch_tracked_items(session, headers) if TRACKING_ENABLED else []
+
+    tenders = {}
+    for info in sorted((i for i in tracked if i["kind"] == "tender"), key=lambda i: i["received"]):
+        deadline = parse_local_deadline(info.get("deadline"))
+        if deadline:
+            if not (now - timedelta(days=1) <= deadline <= now + timedelta(days=14)):
+                continue
+        elif info["received"] < (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"):
+            continue
+        key = (info.get("reference") or info.get("title") or info["subject"]).lower()
+        tenders[key] = info  # newest email per tender wins
+    far_future = now + timedelta(days=3650)
+    tenders = sorted(tenders.values(), key=lambda i: parse_local_deadline(i.get("deadline")) or far_future)
+
+    money = [i for i in tracked if i["kind"] in ("finance", "legal")
+             and i["received"] >= (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")]
+    money.sort(key=lambda i: (parse_local_deadline(i.get("deadline")) or far_future, i["received"]))
+
+    return {
+        "tenders": tenders,
+        "money": money,
+        "drafts": find_unreviewed_drafts(session, headers),
+        "followups": find_waiting_followups(session, headers, followup_cache) if FOLLOWUP_ENABLED else [],
+    }
+
+
+def briefing_priorities_llm(session, data):
+    """Two to four short priority bullets for the top of the briefing ('' on failure)."""
+    if not OPENAI_API_KEY or not (data["tenders"] or data["money"] or data["followups"]):
+        return ""
+    lines = [f"Today is {datetime.now(LOCAL_TZ).strftime('%A %d %B %Y')}."]
+    lines += [f"TENDER: {i.get('title')} | {i.get('organization')} | deadline {i.get('deadline') or 'none'} | "
+              f"{i.get('action')}" for i in data["tenders"][:10]]
+    if not FINANCE_IS_PRIVATE:  # the shared briefing must not leak private finance details
+        lines += [f"{i['kind'].upper()}: {i.get('title')} | {i.get('amount')} | due {i.get('deadline') or 'none'} | "
+                  f"{i.get('action')}" for i in data["money"][:10]]
+    lines += [f"NO REPLY: {w['subject']} to {w['to']}, {w['days']} days" for w in data["followups"][:10]]
+    try:
+        return llm_text(session, [{"role": "user", "content": (
+            f"From the items below, write 2-4 short bullet points (max 18 words each) telling "
+            f"{ADDRESSING_NAME} what to prioritise today, most urgent first. Plain text, each line "
+            "starting with '- '. Use only the items given.\n\n" + "\n".join(lines)
+        )}], timeout=30)
+    except Exception as e:
+        log(f"Briefing priorities skipped: {e}")
+        return ""
+
+
+def _briefing_link(text, url):
+    text = html.escape(text)
+    return f'<a href="{html.escape(url, quote=True)}">{text}</a>' if url else text
+
+
+def build_finance_section_html(money):
+    parts = [f"<p><strong>💰 Finance and legal ({len(money)})</strong></p>"]
+    if money:
+        parts.append("<ul>" + "".join(
+            f"<li>{_briefing_link(i.get('title') or i['subject'], i['email_link'])}"
+            f"{' (' + html.escape(i['organization']) + ')' if i.get('organization') else ''}"
+            f"{' – ' + html.escape(i['amount']) if i.get('amount') else ''}<br>"
+            f"{'Due: ' + html.escape(describe_deadline(i.get('deadline'))) + '<br>' if i.get('deadline') else ''}"
+            f"{html.escape(i.get('action') or i.get('summary') or '')}</li>"
+            for i in money[:15]) + "</ul>")
+    else:
+        parts.append("<p>Nothing open.</p>")
+    return "".join(parts)
+
+
+def build_briefing_html(data, priorities=""):
+    link = _briefing_link
+    parts = [f"<p><strong>☀️ Morning briefing, {datetime.now(LOCAL_TZ).strftime('%A %d %B')}</strong></p>"]
+    if priorities.strip():
+        bullets = [ln.lstrip("-• ").strip() for ln in priorities.splitlines() if ln.strip()]
+        parts.append("<p><strong>Today's priorities</strong></p><ul>"
+                     + "".join(f"<li>{html.escape(b)}</li>" for b in bullets) + "</ul>")
+
+    parts.append(f"<p><strong>📋 Tenders and RFQs ({len(data['tenders'])})</strong></p>")
+    if data["tenders"]:
+        parts.append("<ul>" + "".join(
+            f"<li>{link(i.get('title') or i['subject'], i['email_link'])}"
+            f"{' (' + html.escape(i['organization']) + ')' if i.get('organization') else ''}<br>"
+            f"Deadline: {html.escape(describe_deadline(i.get('deadline')) or 'not stated')}"
+            f"{'<br>' + html.escape(i['action']) if i.get('action') else ''}</li>"
+            for i in data["tenders"][:15]) + "</ul>")
+    else:
+        parts.append("<p>No open tenders with deadlines in the next 14 days.</p>")
+
+    if FINANCE_IS_PRIVATE:
+        parts.append(f"<p><strong>💰 Finance and legal:</strong> {len(data['money'])} open item(s). "
+                     "Details were sent privately.</p>")
+    else:
+        parts.append(build_finance_section_html(data["money"]))
+
+    parts.append(f"<p><strong>✉️ Reply drafts waiting for review ({len(data['drafts'])})</strong></p>")
+    if data["drafts"]:
+        parts.append("<ul>" + "".join(
+            f"<li>{link(d['subject'], d['link'])}{' – to ' + html.escape(d['to']) if d['to'] else ''}</li>"
+            for d in data["drafts"][:15]) + "</ul>")
+    else:
+        parts.append("<p>None from the last 24 hours.</p>")
+
+    if FOLLOWUP_ENABLED:
+        parts.append(f"<p><strong>⏳ Sent, still waiting for a reply ({len(data['followups'])})</strong></p>")
+        if data["followups"]:
+            parts.append("<ul>" + "".join(
+                f"<li><strong>{html.escape(w['to'])}</strong>: {link(w['subject'], w['link'])} "
+                f"({w['days']} days)</li>" for w in data["followups"][:FOLLOWUP_MAX_ITEMS]) + "</ul>")
+        else:
+            parts.append("<p>Nothing waiting.</p>")
+    return "".join(parts)
+
+
+def maybe_send_briefing(session, auth, state, cache):
+    """Send the morning briefing once a day at BRIEFING_HOUR (Dubai time)."""
+    if not BRIEFING_ENABLED:
+        return
+    local_now = datetime.now(LOCAL_TZ)
+    today = local_now.strftime("%Y-%m-%d")
+    if local_now.hour != BRIEFING_HOUR or state.get("last_briefing_date") == today:
+        return
+    state["last_briefing_date"] = today  # set first so a failure doesn't retry every poll
+    save_followup_state(state)
+    try:
+        headers = auth.get_headers()
+        data = collect_briefing(session, headers, cache)
+        counts = (f"{len(data['tenders'])} tender(s), {len(data['money'])} finance/legal, "
+                  f"{len(data['drafts'])} draft(s), {len(data['followups'])} follow-up(s)")
+        sent = send_teams_html(
+            session, headers,
+            f"Morning briefing {local_now.strftime('%d %b')}: {counts}",
+            build_briefing_html(data, briefing_priorities_llm(session, data)),
+        )
+        log(f"Morning briefing {'sent' if sent else 'failed'}: {counts}.")
+        if FINANCE_IS_PRIVATE and data["money"]:
+            send_teams_html(
+                session, headers,
+                f"Finance and legal {local_now.strftime('%d %b')}: {len(data['money'])} open item(s)",
+                build_finance_section_html(data["money"]),
+                to=FINANCE_ALERT_EMAIL,
+            )
+    except Exception as e:
+        log(f"Morning briefing failed: {e}")
+
+
 def build_action_link(draft_id, action):
     if not N8N_ACTION_WEBHOOK_URL or not draft_id:
         return None
@@ -1163,15 +1731,16 @@ def build_action_link(draft_id, action):
     return f"{N8N_ACTION_WEBHOOK_URL}?{urlencode(params)}"
 
 
-def send_teams_html(session, headers, subject, html_content):
-    """Email an HTML message to the Teams channel address. Returns True on success."""
-    if not TEAMS_CHANNEL_EMAIL:
+def send_teams_html(session, headers, subject, html_content, to=None):
+    """Email an HTML message to the Teams channel address (or `to`). Returns True on success."""
+    to = to or TEAMS_CHANNEL_EMAIL
+    if not to:
         return False
     payload = {
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": html_content},
-            "toRecipients": [{"emailAddress": {"address": TEAMS_CHANNEL_EMAIL}}],
+            "toRecipients": [{"emailAddress": {"address": to}}],
         },
         "saveToSentItems": False,
     }
@@ -1188,7 +1757,7 @@ def send_teams_html(session, headers, subject, html_content):
         return False
 
 
-def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary, outlook_link="", draft_id=None, attachment_names=None):
+def send_teams_channel_notification(session, headers, sender, subject, received, ai_summary, outlook_link="", draft_id=None, attachment_names=None, extra_html=""):
     safe_sender = html.escape(sender or "unknown")
     safe_subject = html.escape(subject or "(no subject)")
     safe_received = html.escape(format_received_abudhabi(received))
@@ -1228,6 +1797,7 @@ def send_teams_channel_notification(session, headers, sender, subject, received,
         f"Received: {safe_received}</p>"
         f"{open_in_outlook_html}"
         f"<p><strong>AI Summary:</strong><br>{safe_summary}</p>"
+        f"{extra_html}"
         f"{action_buttons_html}",
     )
 
@@ -1247,6 +1817,7 @@ def main():
     )
 
     style = StyleGuide()
+    tender_sheet = TenderSheet()
     followup_state = load_followup_state()
     expects_reply_cache = {}
     seen_ids = load_seen_ids(SEEN_IDS_FILE)
@@ -1266,7 +1837,10 @@ def main():
                 url=url,
                 timeout=30,
             )
-            maybe_send_followup_digest(session, auth, followup_state, expects_reply_cache)
+            if BRIEFING_ENABLED:
+                maybe_send_briefing(session, auth, followup_state, expects_reply_cache)
+            else:
+                maybe_send_followup_digest(session, auth, followup_state, expects_reply_cache)
 
             if items is None:
                 time.sleep(POLL_SECONDS)
@@ -1295,14 +1869,33 @@ def main():
                 except (requests.RequestException, RuntimeError) as e:
                     log(f"Failed to fetch message body for {mid}: {e}")
                     continue
+                tracking = None
+                if TRACKING_ENABLED:
+                    try:
+                        tracking, details = track_email(
+                            session, headers, m, details, followup_state, tender_sheet=tender_sheet
+                        )
+                    except Exception as e:
+                        log(f"Tracking check failed for {mid}: {e}")
+                    if tracking:
+                        log(f"Tracked {tracking['kind']}: {tracking.get('title') or m.get('subject')}")
+                # Finance/legal alerts go out on their own when finance is private, or
+                # when the email isn't drafted; tenders on drafted emails are folded
+                # into the normal notification instead of a second message.
+                if tracking and not tracking["duplicate"] and (
+                    not process or (tracking["kind"] != "tender" and FINANCE_IS_PRIVATE)
+                ):
+                    if send_tracking_alert(session, headers, m, tracking):
+                        log(f"{tracking['kind'].title()} alert sent")
+
                 if not process:
                     if DEV_MODE or details is not None:
                         log(f"Skipped email from {sender}: {reason}")
                     continue
                 full_body = details["body"]
 
-                attachments_text, attachment_names = "", []
-                if ATTACHMENTS_ENABLED and details["has_attachments"]:
+                attachments_text, attachment_names = details.get("attachments") or ("", [])
+                if ATTACHMENTS_ENABLED and details["has_attachments"] and "attachments" not in details:
                     try:
                         attachments_text, attachment_names = get_attachments_text(session, headers, mid)
                         if attachments_text:
@@ -1363,6 +1956,11 @@ def main():
                     outlook_link=m.get("webLink") or "",
                     draft_id=draft_id,
                     attachment_names=attachment_names,
+                    extra_html=(
+                        build_tracking_html(tracking)
+                        if tracking and (tracking["kind"] == "tender" or not FINANCE_IS_PRIVATE)
+                        else ""
+                    ),
                 )
                 if teams_sent:
                     log("Teams message sent")
@@ -1378,7 +1976,13 @@ PREVIEW_USAGE = """Read-only previews (no drafts, no Teams messages; LLM calls a
   python3 email_bot.py --check-filter [N]        draft/skip decision for the last N inbox emails (default 30)
   python3 email_bot.py --preview-style           the writing style learned from Sent Items
   python3 email_bot.py --preview-followups       sent emails that would be in today's follow-up digest
-  python3 email_bot.py --preview-attachments [N] text read from attachments in the last N inbox emails (default 30)"""
+  python3 email_bot.py --preview-attachments [N] text read from attachments in the last N inbox emails (default 30)
+  python3 email_bot.py --check-tracking [N]      tender/finance/legal detection for the last N inbox emails (default 30)
+  python3 email_bot.py --preview-briefing        the morning briefing as plain text
+
+Writes to the mailbox (no Teams messages):
+  python3 email_bot.py --backfill-tracking [DAYS] flag tenders/finance/legal from the last DAYS days (default 14)
+                                                  in Outlook and add tenders to the Tenders sheet tab"""
 
 
 def run_preview(mode, count):
@@ -1396,18 +2000,40 @@ def run_preview(mode, count):
         for w in items:
             print(f"  {w['days']:>2} days | {w['sent']} | to {w['to']} | {w['subject']}")
         return
-    inbox = session.get(
-        f"{GRAPH_USER_URL}/mailFolders/Inbox/messages",
-        headers=headers,
-        params={
-            "$top": str(count),
-            "$orderby": "receivedDateTime desc",
-            "$select": "id,subject,from,toRecipients,ccRecipients,conversationId,receivedDateTime,hasAttachments",
-        },
-        timeout=30,
-    )
-    raise_for_status_with_details(inbox, "Inbox fetch")
-    for m in inbox.json().get("value", []):
+    if mode == "--preview-briefing":
+        data = collect_briefing(session, headers)
+        print(briefing_priorities_llm(session, data) or "(no priorities)")
+        print(f"\nTENDERS ({len(data['tenders'])})")
+        for i in data["tenders"]:
+            print(f"  {describe_deadline(i.get('deadline')) or 'no deadline':32} | {i.get('organization')} | {i.get('title')}")
+        print(f"\nFINANCE/LEGAL ({len(data['money'])})" + ("  [private: shared briefing shows only the count]" if FINANCE_IS_PRIVATE else ""))
+        for i in data["money"]:
+            print(f"  {i['kind']:7} | {i.get('amount') or '-':15} | {describe_deadline(i.get('deadline')) or 'no due date':32} | {i.get('title')}")
+        print(f"\nDRAFTS TO REVIEW ({len(data['drafts'])})")
+        for d in data["drafts"]:
+            print(f"  {d['subject']} | to {d['to']}")
+        print(f"\nFOLLOW-UPS ({len(data['followups'])})")
+        for w in data["followups"]:
+            print(f"  {w['days']:>2} days | to {w['to']} | {w['subject']}")
+        return
+
+    params = {
+        "$top": str(min(count, 100)),
+        "$orderby": "receivedDateTime desc",
+        "$select": "id,subject,from,toRecipients,ccRecipients,conversationId,receivedDateTime,"
+                   "hasAttachments,bodyPreview,webLink",
+    }
+    if mode == "--backfill-tracking":
+        start = (datetime.now(timezone.utc) - timedelta(days=count)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        params["$filter"] = f"receivedDateTime ge {start}"
+        messages = graph_get_all(session, headers, f"{GRAPH_USER_URL}/mailFolders/Inbox/messages", params, limit=5000)
+        messages.reverse()  # oldest first, so each tender's sheet row ends with its newest details
+    else:
+        messages = graph_get_all(session, headers, f"{GRAPH_USER_URL}/mailFolders/Inbox/messages", params, limit=count)
+    state = {}
+    tender_sheet = TenderSheet() if mode == "--backfill-tracking" else None
+    tracked = 0
+    for m in messages:
         sender = (m.get("from") or {}).get("emailAddress", {}).get("address", "unknown")
         when = format_received_abudhabi(m.get("receivedDateTime"))[5:16]
         subject = (m.get("subject") or "")[:50]
@@ -1419,13 +2045,30 @@ def run_preview(mode, count):
             print(f"{when} | {sender[:35]} | {subject}")
             print(f"    files: {names}")
             print(f"    text read: {len(text)} chars | starts: {text[:150].replace(chr(10), ' ')!r}")
+        elif mode in ("--check-tracking", "--backfill-tracking"):
+            backfill = mode == "--backfill-tracking"
+            kind = tracking_candidate_kind(m)
+            if not kind:
+                continue
+            info, _ = track_email(session, headers, m, None, state, mark=backfill, tender_sheet=tender_sheet)
+            if info:
+                tracked += 1
+                print(f"{info['kind'].upper():7} | {when} | {sender[:30]:30} | {info.get('title')[:55]:55} | "
+                      f"deadline {info.get('deadline') or '-':16} | {info.get('action')}")
+            elif not backfill:
+                print(f"{'-':7} | {when} | {sender[:30]:30} | {subject:55} | pre-check '{kind}', LLM: not important")
+    if mode in ("--check-tracking", "--backfill-tracking"):
+        print(f"\n{tracked} email(s) {'flagged in Outlook' if mode == '--backfill-tracking' else 'would be tracked'}.")
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         mode = sys.argv[1]
-        if mode not in ("--check-filter", "--preview-style", "--preview-followups", "--preview-attachments"):
+        modes = ("--check-filter", "--preview-style", "--preview-followups", "--preview-attachments",
+                 "--check-tracking", "--preview-briefing", "--backfill-tracking")
+        if mode not in modes:
             sys.exit(PREVIEW_USAGE)
-        run_preview(mode, int(sys.argv[2]) if len(sys.argv) > 2 else 30)
+        default = 14 if mode == "--backfill-tracking" else 30
+        run_preview(mode, int(sys.argv[2]) if len(sys.argv) > 2 else default)
     else:
         main()

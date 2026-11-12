@@ -51,6 +51,47 @@ that the LLM judges to expect a reply, and whose conversation has no later messa
 The last-sent date is kept in `FOLLOWUP_STATE_FILE`; on Render it resets on deploy, so a deploy
 during the digest hour can send that day's digest twice.
 
+### Tenders, finance and legal (`TRACKING_ENABLED`)
+
+Every inbox email with the mailbox in To or Cc goes through a keyword check (tender, RFQ, RFP,
+negotiation, payment, overdue, guarantee, VAT, notice, ...; banks and `gov.ae` senders always pass).
+About 30 a day pass and get one LLM call that decides whether it is a **tender**, **finance** or
+**legal** matter, whether it is **important** (needs action or money is at risk), and extracts the
+organization, reference, amount, deadline, stage and the action needed. Receipts, confirmations,
+statements, newsletters and webinars are not important and are left alone.
+
+For important ones the bot:
+- flags the email in Outlook, with the deadline as the flag's due date (it shows in Outlook's
+  flagged list and Microsoft To Do), adds a **Tender**, **Finance** or **Legal** category, and stores
+  the extracted details on the email itself (a custom property, no extra storage or permissions);
+- sends a Teams alert, or adds the details to the normal notification when the email also gets a
+  reply draft. Oracle-style sourcing systems send many emails per negotiation, so each tender
+  reference and stage alerts at most once a day;
+- for **tenders only**, adds or updates a row in the **Tenders** tab of the lead Google Sheet
+  (one row per reference). Columns A–K are the bot's; **Ednex status** and **Notes** are for people
+  and never overwritten. Needs the same Google service account key as the lead bot; without it the
+  sheet is skipped and everything else still works.
+
+**Finance and legal details are never written to any sheet.** They stay on the email in Outlook
+and in Teams. Set `FINANCE_ALERT_EMAIL` to send them to a separate private channel instead; the
+shared briefing then shows only a count.
+
+When an item is handled, mark the Outlook flag complete and it drops out of the briefing.
+
+### Morning briefing (`BRIEFING_ENABLED`)
+
+Every day at `BRIEFING_HOUR` (Dubai time, default 8) one Teams message with: 2–4 AI-written
+priorities for the day; open tenders with deadlines in the next 14 days; open finance and legal
+items; reply drafts from the last 24 hours still waiting for review; and sent emails still waiting
+for a reply (this replaces the separate follow-up digest while the briefing is on).
+
+To fill the tracker with the last two weeks before the first briefing, run once (flags emails
+and fills the Tenders tab; sends no Teams messages):
+
+```bash
+python3 email_bot.py --backfill-tracking 14
+```
+
 ### Read-only previews
 
 Check each feature against the real mailbox without creating drafts or Teams messages (LLM calls
@@ -61,6 +102,8 @@ python3 email_bot.py --check-filter 50        # draft/skip decision + reason for
 python3 email_bot.py --preview-style          # the learned writing style
 python3 email_bot.py --preview-followups      # what today's follow-up digest would list
 python3 email_bot.py --preview-attachments 50 # text read from attachments in the last 50 inbox emails
+python3 email_bot.py --check-tracking 100     # what tender/finance/legal tracking would flag
+python3 email_bot.py --preview-briefing       # tomorrow's morning briefing as plain text
 ```
 
 ## Files
