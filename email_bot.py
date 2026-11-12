@@ -469,14 +469,36 @@ def generate_email_summary_with_llm(session, sender, subject, body_text, thread_
         return fallback
 
 
+def build_reply_body_html(reply_text, existing_body):
+    """Return an HTML body with reply_text on top of the draft's existing
+    content (the quoted original email that createReplyAll puts in)."""
+    reply_lines = html.escape((reply_text or "").replace("\r\n", "\n")).replace("\n", "<br>")
+    reply_html = (
+        '<div style="font-family: Calibri, Arial, Helvetica, sans-serif; font-size: 11pt;">'
+        f"{reply_lines}</div><br>"
+    )
+
+    content = existing_body.get("content") or ""
+    if (existing_body.get("contentType") or "").lower() != "html":
+        content = html.escape(content.replace("\r\n", "\n")).replace("\n", "<br>")
+
+    body_tag = re.search(r"<body[^>]*>", content, flags=re.IGNORECASE)
+    if body_tag:
+        return content[:body_tag.end()] + reply_html + content[body_tag.end():]
+    return reply_html + content
+
+
 def create_reply_draft(session, headers, original_message, reply_text):
     message_id = original_message.get("id")
     if not message_id:
         return None
 
     # Use Graph's native reply-all logic to preserve correct To/Cc recipients.
+    # Ask for an HTML body so the draft comes back with the quoted original
+    # email ("From: ... Sent: ...") already in it, as Outlook's Reply All does.
+    html_headers = {**headers, "Prefer": 'outlook.body-content-type="html"'}
     create_url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages/{message_id}/createReplyAll"
-    create_resp = session.post(create_url, headers=headers, timeout=30)
+    create_resp = session.post(create_url, headers=html_headers, timeout=30)
     raise_for_status_with_details(create_resp, "Create reply draft")
     draft = create_resp.json()
     draft_id = draft.get("id")
@@ -484,10 +506,18 @@ def create_reply_draft(session, headers, original_message, reply_text):
         return None
 
     patch_url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_USER_ENCODED}/messages/{draft_id}"
+    existing_body = draft.get("body") or {}
+    if not existing_body.get("content"):
+        get_resp = session.get(patch_url, headers=html_headers, params={"$select": "body"}, timeout=30)
+        raise_for_status_with_details(get_resp, "Read reply draft body")
+        existing_body = get_resp.json().get("body") or {}
+
+    # Put the AI reply above the quoted original instead of replacing the
+    # whole body, so the draft (and the sent reply) keeps the conversation.
     patch_body = {
         "body": {
-            "contentType": "Text",
-            "content": reply_text,
+            "contentType": "HTML",
+            "content": build_reply_body_html(reply_text, existing_body),
         },
     }
     patch_headers = {**headers, "Content-Type": "application/json"}
